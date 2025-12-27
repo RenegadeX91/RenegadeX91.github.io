@@ -64,12 +64,41 @@
     pointer-events: none;
   }
 
+  .badge-tier {
+    position: absolute;
+    bottom: -7px;
+    right: -7px;
+    z-index: 3;
+    font-size: 10px;
+    line-height: 1;
+    padding: 3px 6px;
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.25);
+    background: rgba(0,0,0,0.55);
+    color: rgba(255,255,255,0.9);
+    pointer-events: none;
+  }
+
+  .badge-q {
+    position: absolute;
+    top: -7px;
+    right: -7px;
+    z-index: 3;
+    font-size: 10px;
+    line-height: 1;
+    padding: 3px 6px;
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.25);
+    background: rgba(0,0,0,0.55);
+    color: rgba(255,255,255,0.85);
+    pointer-events: none;
+  }
+
   /* =========================
      Diamond / 45° grid view
      ========================= */
   #grid-rot-wrap {
-    /* Prevents clipping when the grid rotates (diamond gets bigger) */
-    padding: 80px;
+    padding: 80px; /* prevents diamond clipping */
     display: flex;
     justify-content: center;
     align-items: center;
@@ -80,16 +109,19 @@
     transform-origin: center;
   }
 
-  /* Keep room icons upright, while the grid and corridors rotate */
-  #temple-grid .room {
+  /* Keep icons/badges upright */
+  #temple-grid .room,
+  #temple-grid .badge,
+  #temple-grid .badge-tier,
+  #temple-grid .badge-q {
     transform: rotate(-45deg);
     transform-origin: center;
   }
 
-  /* Keep badges upright too */
-  #temple-grid .badge {
-    transform: rotate(-45deg);
-    transform-origin: center;
+  /* small helper text */
+  .mini {
+    font-size: 12px;
+    opacity: 0.85;
   }
 </style>
 </head>
@@ -103,14 +135,28 @@ let selectedRoom = null;
 let selectedFloor = null;
 let planningMode = false;
 
-/* ===============================
-   "Entrance" / connectivity root
-   =============================== */
 const ENTRANCE = { r: GRID_SIZE - 1, c: Math.floor(GRID_SIZE / 2) }; // (8,4)
 const entranceIndex = () => ENTRANCE.r * GRID_SIZE + ENTRANCE.c;
 
 let uiMessage = "";
-let suggestedMove = null; // { kind, index, step, roomKey }
+let suggestedMove = null; // { kind, index, step, roomKey, fromHand?, useUramot? }
+let tutorialOpen = false;
+
+/* ----------------------------
+   Medallion + hand state
+   ---------------------------- */
+let medallions = {
+  Jatalot: 0,   // Protect/lock
+  Quipal: 0,    // Upgrade +1 tier once per room
+  Puaets: 0,    // Reroll hand
+  Uramot: 0,    // Place missing room (hand override)
+  Zopex: 0,
+  Ascappers: 0
+};
+
+let useHandMode = false;
+// 6-card hand. Values are room keys or null.
+let hand = Array(6).fill(null);
 
 /* ----------------------------
    Grid model
@@ -118,7 +164,10 @@ let suggestedMove = null; // { kind, index, step, roomKey }
 let grid = Array(GRID_SIZE * GRID_SIZE).fill(null).map(() => ({
   room: null,
   floor: null,
-  faded: false
+  faded: false,
+  tier: 1,          // I/II/III
+  locked: false,    // Jatalot lock
+  quipalUsed: false // can only apply Quipal once per room
 }));
 
 const FLOOR_TILES = [
@@ -206,16 +255,35 @@ const BOOST_RULES = {
   }
 };
 
-function formatBonuses(tileKey, count = 1) {
+function roman(n) {
+  if (n === 1) return "I";
+  if (n === 2) return "II";
+  if (n === 3) return "III";
+  return String(n);
+}
+
+function clampTier(t) {
+  return Math.max(1, Math.min(3, t));
+}
+
+function tierPercentFactor(t) {
+  // Designed so "tier 3 value" ~ "full value"
+  // 60% -> 15/30/60, 40% -> 10/20/40
+  if (t === 1) return 0.25;
+  if (t === 2) return 0.50;
+  return 1.00;
+}
+
+function formatBonuses(tileKey, countPercent = 1, countFlat = 1) {
   return ROOM_TILES[tileKey]?.bonuses.map(b => {
     if (b.startsWith("MEDALLION:")) {
       const [, chance, type] = b.split(":");
-      return `+${count} ${chance === "HIGH" ? "High" : "Low"} Chance ${type} Medallion`;
+      return `+${countFlat} ${chance === "HIGH" ? "High" : "Low"} Chance ${type} Medallion`;
     }
-    if (b.startsWith("ITEM:")) return `+${count} ${b.slice(5)}`;
-    if (b.startsWith("ADD:")) return `Adds ${count} ${b.slice(4)} to map`;
+    if (b.startsWith("ITEM:")) return `+${countFlat} ${b.slice(5)}`;
+    if (b.startsWith("ADD:")) return `Adds ${countFlat} ${b.slice(4)} to map`;
     const m = b.match(/(\d+)%\s*(.*)/);
-    if (m) return `${Math.round(parseInt(m[1]) * count)}% ${m[2]}`;
+    if (m) return `${Math.round(parseInt(m[1]) * countPercent)}% ${m[2]}`;
     return b;
   }) ?? [];
 }
@@ -298,7 +366,6 @@ function connectedFromEntrance() {
   return visited;
 }
 
-// Detect cycle in the connected component containing Entrance
 function entranceHasLoop() {
   const start = entranceIndex();
   const visited = new Set();
@@ -316,7 +383,7 @@ function entranceHasLoop() {
         stack.push(nxt);
       } else {
         const p = parent.get(node);
-        if (p !== nxt) return true; // undirected cycle
+        if (p !== nxt) return true;
       }
     }
   }
@@ -352,7 +419,7 @@ function connectCells(a, b) {
 }
 
 /* ===============================
-   Spymaster conversion (Barracks -> Legion Barracks)
+   Spymaster conversion
    =============================== */
 function isActiveRoom(i, key) {
   return grid[i].room === key && !grid[i].faded;
@@ -365,7 +432,6 @@ function hasActiveAdjacent(i, key) {
   return false;
 }
 
-// If TranscendentBarracks is adjacent to an active Spymaster, treat as LegionBarrack
 function getEffectiveRoomKey(i) {
   const cell = grid[i];
   if (!cell.room || cell.faded) return cell.room;
@@ -377,17 +443,36 @@ function getEffectiveRoomKey(i) {
 }
 
 /* ===============================
+   Hand helpers (optional)
+   =============================== */
+function handCounts() {
+  const m = {};
+  for (const x of hand) {
+    if (!x) continue;
+    m[x] = (m[x] || 0) + 1;
+  }
+  return m;
+}
+
+function consumeFromHand(roomKey) {
+  for (let i = 0; i < hand.length; i++) {
+    if (hand[i] === roomKey) {
+      hand[i] = null;
+      return true;
+    }
+  }
+  return false;
+}
+
+/* ===============================
    Auto-solvers
    =============================== */
-
-/* --- Spymaster Snake (left side) --- */
 const SNAKE_PATTERN = ["Armoury", "TranscendentBarracks", "Spymaster", "TranscendentBarracks"];
 let cachedSnake = null;
 
 function getSnakePath() {
   if (cachedSnake) return cachedSnake;
 
-  // columns 3..0 in a vertical serpentine
   const cols = [3,2,1,0];
   const path = [];
   let up = true;
@@ -402,9 +487,7 @@ function getSnakePath() {
   return cachedSnake;
 }
 
-function expectedSnakeRoom(step) {
-  return SNAKE_PATTERN[step % SNAKE_PATTERN.length];
-}
+function expectedSnakeRoom(step) { return SNAKE_PATTERN[step % SNAKE_PATTERN.length]; }
 
 function snakeFirstEmptyStep() {
   const path = getSnakePath();
@@ -418,13 +501,8 @@ function snakeFirstEmptyStep() {
 function ensureSnakeFloors(uptoStepInclusive) {
   const path = getSnakePath();
   if (uptoStepInclusive === null || uptoStepInclusive < 0) return;
-
-  // Entrance -> first snake tile
   connectCells(entranceIndex(), path[0]);
-
-  for (let step = 0; step < uptoStepInclusive; step++) {
-    connectCells(path[step], path[step + 1]);
-  }
+  for (let step = 0; step < uptoStepInclusive; step++) connectCells(path[step], path[step + 1]);
 }
 
 function validateSnakePrefix() {
@@ -440,35 +518,19 @@ function validateSnakePrefix() {
   return mismatches;
 }
 
-function suggestSnakeNext() {
-  const path = getSnakePath();
-  const mismatches = validateSnakePrefix();
-
-  const step = snakeFirstEmptyStep();
-  if (step === null) return { ok: false, reason: "Snake path is full." };
-
-  const i = path[step];
-  const roomKey = expectedSnakeRoom(step);
-
-  return { ok: true, move: { kind: "snake", index: i, step, roomKey }, warn: mismatches.length ? mismatches : null };
-}
-
-/* --- Corruption package (right side branch) --- */
 const CORRUPT_PATTERN = ["Generator", "SacrificialChamber", "Thaumaturge", "CorruptionChamber", "AlchemyLab", "SealedVault"];
 let cachedCorrupt = null;
 
 function getCorruptionPath() {
   if (cachedCorrupt) return cachedCorrupt;
 
-  // A simple vertical branch starting at (8,5) going upward.
-  // This stays on the "right side" and is always loop-free if only connected at Entrance.
   const coords = [
-    { r: GRID_SIZE - 1, c: 5 }, // (8,5)
-    { r: GRID_SIZE - 2, c: 5 }, // (7,5)
-    { r: GRID_SIZE - 3, c: 5 }, // (6,5)
-    { r: GRID_SIZE - 4, c: 5 }, // (5,5)
-    { r: GRID_SIZE - 5, c: 5 }, // (4,5)
-    { r: GRID_SIZE - 6, c: 5 }, // (3,5)
+    { r: GRID_SIZE - 1, c: 5 },
+    { r: GRID_SIZE - 2, c: 5 },
+    { r: GRID_SIZE - 3, c: 5 },
+    { r: GRID_SIZE - 4, c: 5 },
+    { r: GRID_SIZE - 5, c: 5 },
+    { r: GRID_SIZE - 6, c: 5 },
   ];
 
   cachedCorrupt = coords
@@ -479,9 +541,7 @@ function getCorruptionPath() {
   return cachedCorrupt;
 }
 
-function expectedCorruptRoom(step) {
-  return CORRUPT_PATTERN[step % CORRUPT_PATTERN.length];
-}
+function expectedCorruptRoom(step) { return CORRUPT_PATTERN[step % CORRUPT_PATTERN.length]; }
 
 function corruptFirstEmptyStep() {
   const path = getCorruptionPath();
@@ -495,13 +555,8 @@ function corruptFirstEmptyStep() {
 function ensureCorruptionFloors(uptoStepInclusive) {
   const path = getCorruptionPath();
   if (uptoStepInclusive === null || uptoStepInclusive < 0) return;
-
-  // Entrance -> first corruption tile (branch)
   connectCells(entranceIndex(), path[0]);
-
-  for (let step = 0; step < uptoStepInclusive; step++) {
-    connectCells(path[step], path[step + 1]);
-  }
+  for (let step = 0; step < uptoStepInclusive; step++) connectCells(path[step], path[step + 1]);
 }
 
 function validateCorruptionPrefix() {
@@ -517,57 +572,54 @@ function validateCorruptionPrefix() {
   return mismatches;
 }
 
-function suggestCorruptionNext() {
-  const path = getCorruptionPath();
-  const mismatches = validateCorruptionPrefix();
+/* ---- Hand-aware suggestions ---- */
+function suggestNext(kind) {
+  if (kind === "snake") {
+    const path = getSnakePath();
+    const mismatches = validateSnakePrefix();
+    const step = snakeFirstEmptyStep();
+    if (step === null) return { ok: false, reason: "Snake path is full." };
+    const i = path[step];
+    const roomKey = expectedSnakeRoom(step);
 
-  const step = corruptFirstEmptyStep();
-  if (step === null) return { ok: false, reason: "Corruption path is full." };
+    // Hand constraints
+    if (useHandMode) {
+      const counts = handCounts();
+      if ((counts[roomKey] || 0) > 0) {
+        return { ok: true, move: { kind, index: i, step, roomKey, fromHand: true }, warn: mismatches.length ? mismatches : null };
+      }
+      if (medallions.Uramot > 0) {
+        return { ok: true, move: { kind, index: i, step, roomKey, useUramot: true }, warn: mismatches.length ? mismatches : null };
+      }
+      return { ok: false, reason: `Need ${ROOM_NAMES[roomKey]} but it isn't in your hand. Use Puaets to reroll, or Uramot to place anyway.` };
+    }
 
-  const i = path[step];
-  const roomKey = expectedCorruptRoom(step);
-
-  return { ok: true, move: { kind: "corrupt", index: i, step, roomKey }, warn: mismatches.length ? mismatches : null };
-}
-
-/* --- Shared solver actions --- */
-function clearAllRoomsAndFloors() {
-  grid.forEach(c => {
-    c.room = null;
-    c.floor = null;
-    c.faded = false;
-  });
-  suggestedMove = null;
-}
-
-function applySuggestion(s) {
-  if (!s.ok) {
-    uiMessage = s.reason;
-    suggestedMove = null;
-    return;
+    return { ok: true, move: { kind, index: i, step, roomKey }, warn: mismatches.length ? mismatches : null };
   }
 
-  suggestedMove = s.move;
-  const { kind, index, step, roomKey } = s.move;
+  if (kind === "corrupt") {
+    const path = getCorruptionPath();
+    const mismatches = validateCorruptionPrefix();
+    const step = corruptFirstEmptyStep();
+    if (step === null) return { ok: false, reason: "Corruption path is full." };
+    const i = path[step];
+    const roomKey = expectedCorruptRoom(step);
 
-  if (grid[index].room && grid[index].room !== roomKey) {
-    uiMessage = `Target cell already has ${ROOM_NAMES[grid[index].room]} (expected ${ROOM_NAMES[roomKey]}). Clear it or rebuild.`;
-    return;
+    if (useHandMode) {
+      const counts = handCounts();
+      if ((counts[roomKey] || 0) > 0) {
+        return { ok: true, move: { kind, index: i, step, roomKey, fromHand: true }, warn: mismatches.length ? mismatches : null };
+      }
+      if (medallions.Uramot > 0) {
+        return { ok: true, move: { kind, index: i, step, roomKey, useUramot: true }, warn: mismatches.length ? mismatches : null };
+      }
+      return { ok: false, reason: `Need ${ROOM_NAMES[roomKey]} but it isn't in your hand. Use Puaets to reroll, or Uramot to place anyway.` };
+    }
+
+    return { ok: true, move: { kind, index: i, step, roomKey }, warn: mismatches.length ? mismatches : null };
   }
 
-  grid[index].room = roomKey;
-  grid[index].faded = planningMode;
-
-  if (kind === "snake") ensureSnakeFloors(step);
-  if (kind === "corrupt") ensureCorruptionFloors(step);
-
-  const warn = s.warn || [];
-  if (warn.length) {
-    const first = warn[0];
-    uiMessage = `Placed ${kind} step ${step + 1}, but mismatch earlier at step ${first.step + 1} (expected ${ROOM_NAMES[first.expected]}, found ${ROOM_NAMES[first.found]}).`;
-  } else {
-    uiMessage = `Placed ${kind} step ${step + 1}: ${ROOM_NAMES[roomKey]} at (${rc(index).r},${rc(index).c}).`;
-  }
+  return { ok: false, reason: "Unknown kind" };
 }
 
 function setSuggestionOnly(s) {
@@ -587,80 +639,233 @@ function setSuggestionOnly(s) {
   }
 }
 
-function autoBuildSnake(nSteps) {
-  // Does NOT clear. It fills from first empty.
-  const path = getSnakePath();
-  const start = snakeFirstEmptyStep();
-  if (start === null) { uiMessage = "Snake is already full."; return; }
-
-  const steps = Math.max(0, Math.min(nSteps, path.length - start));
-  let lastPlaced = null;
-
-  for (let s = 0; s < steps; s++) {
-    const step = start + s;
-    const i = path[step];
-    if (grid[i].room) continue;
-    grid[i].room = expectedSnakeRoom(step);
-    grid[i].faded = planningMode;
-    lastPlaced = step;
+function applySuggestion(s) {
+  if (!s.ok) {
+    uiMessage = s.reason;
+    suggestedMove = null;
+    return;
   }
 
-  if (lastPlaced !== null) ensureSnakeFloors(lastPlaced);
-  uiMessage = `Auto-built Snake: ${steps} step(s) from first empty.`;
-  suggestedMove = null;
+  suggestedMove = s.move;
+  const { kind, index, step, roomKey, fromHand, useUramot } = s.move;
+
+  if (grid[index].room && grid[index].room !== roomKey) {
+    uiMessage = `Target cell already has ${ROOM_NAMES[grid[index].room]} (expected ${ROOM_NAMES[roomKey]}). Clear it first.`;
+    return;
+  }
+
+  // Consume resources if hand mode
+  if (useHandMode) {
+    if (fromHand) {
+      if (!consumeFromHand(roomKey)) {
+        uiMessage = `Internal: couldn't consume ${ROOM_NAMES[roomKey]} from hand.`;
+        return;
+      }
+    } else if (useUramot) {
+      if (medallions.Uramot <= 0) {
+        uiMessage = "No Uramot medallions available.";
+        return;
+      }
+      medallions.Uramot -= 1;
+    } else {
+      uiMessage = "Internal: hand-mode move must be fromHand or useUramot.";
+      return;
+    }
+  }
+
+  // Place room + reset per-room flags
+  grid[index].room = roomKey;
+  grid[index].faded = planningMode;
+  grid[index].tier = 1;
+  grid[index].locked = false;
+  grid[index].quipalUsed = false;
+
+  if (kind === "snake") ensureSnakeFloors(step);
+  if (kind === "corrupt") ensureCorruptionFloors(step);
+
+  const warn = s.warn || [];
+  if (warn.length) {
+    const first = warn[0];
+    uiMessage = `Placed ${kind} step ${step + 1}, but mismatch earlier at step ${first.step + 1} (expected ${ROOM_NAMES[first.expected]}, found ${ROOM_NAMES[first.found]}).`;
+  } else {
+    uiMessage = `Placed ${kind} step ${step + 1}: ${ROOM_NAMES[roomKey]} at (${rc(index).r},${rc(index).c}).`;
+  }
 }
 
-function autoBuildCorruption(nSteps) {
-  const path = getCorruptionPath();
-  const start = corruptFirstEmptyStep();
-  if (start === null) { uiMessage = "Corruption path is already full."; return; }
-
-  const steps = Math.max(0, Math.min(nSteps, path.length - start));
-  let lastPlaced = null;
-
-  for (let s = 0; s < steps; s++) {
-    const step = start + s;
-    const i = path[step];
-    if (grid[i].room) continue;
-    grid[i].room = expectedCorruptRoom(step);
-    grid[i].faded = planningMode;
-    lastPlaced = step;
-  }
-
-  if (lastPlaced !== null) ensureCorruptionFloors(lastPlaced);
-  uiMessage = `Auto-built Corruption package: ${steps} step(s) from first empty.`;
-  suggestedMove = null;
+/* ===============================
+   Medallion advice engine
+   =============================== */
+function findIndices(predicate) {
+  const out = [];
+  for (let i = 0; i < grid.length; i++) if (predicate(i, grid[i])) out.push(i);
+  return out;
 }
 
-function autoBuildPlan(snakeSteps, corruptSteps) {
-  clearAllRoomsAndFloors();
+function getMedallionAdvice(connected) {
+  const advice = [];
 
-  // place snake
-  const sp = getSnakePath();
-  const sCount = Math.max(0, Math.min(snakeSteps, sp.length));
-  for (let step = 0; step < sCount; step++) {
-    const i = sp[step];
-    grid[i].room = expectedSnakeRoom(step);
-    grid[i].faded = planningMode;
+  // --- Jatalot: lock choke points ---
+  if (medallions.Jatalot > 0) {
+    const snakeRoot = getSnakePath()[0];
+    const corruptRoot = getCorruptionPath()[0];
+
+    if (grid[snakeRoot]?.room && !grid[snakeRoot].locked) {
+      advice.push({
+        key: "lock-snake-root",
+        text: `Use Jatalot to LOCK Snake root (${ROOM_NAMES[grid[snakeRoot].room]}) at (${rc(snakeRoot).r},${rc(snakeRoot).c}).`,
+        canApply: true,
+        apply: () => {
+          if (medallions.Jatalot <= 0) return;
+          grid[snakeRoot].locked = true;
+          medallions.Jatalot -= 1;
+          uiMessage = "Locked Snake root (Jatalot).";
+        }
+      });
+    } else if (grid[corruptRoot]?.room && !grid[corruptRoot].locked) {
+      advice.push({
+        key: "lock-corrupt-root",
+        text: `Use Jatalot to LOCK Corruption root (${ROOM_NAMES[grid[corruptRoot].room]}) at (${rc(corruptRoot).r},${rc(corruptRoot).c}).`,
+        canApply: true,
+        apply: () => {
+          if (medallions.Jatalot <= 0) return;
+          grid[corruptRoot].locked = true;
+          medallions.Jatalot -= 1;
+          uiMessage = "Locked Corruption root (Jatalot).";
+        }
+      });
+    }
+
+    // Optional: lock Sacrificial chamber if present (very “core” in transcript)
+    const sac = findIndices((i,c) => c.room === "SacrificialChamber" && !c.faded && connected.has(i) && !c.locked)[0];
+    if (sac !== undefined) {
+      advice.push({
+        key: "lock-sac",
+        text: `Use Jatalot to LOCK Sacrificial Chamber at (${rc(sac).r},${rc(sac).c}).`,
+        canApply: true,
+        apply: () => {
+          if (medallions.Jatalot <= 0) return;
+          grid[sac].locked = true;
+          medallions.Jatalot -= 1;
+          uiMessage = "Locked Sacrificial Chamber (Jatalot).";
+        }
+      });
+    }
   }
-  if (sCount > 0) ensureSnakeFloors(sCount - 1);
 
-  // place corruption
-  const cp = getCorruptionPath();
-  const cCount = Math.max(0, Math.min(corruptSteps, cp.length));
-  for (let step = 0; step < cCount; step++) {
-    const i = cp[step];
-    grid[i].room = expectedCorruptRoom(step);
-    grid[i].faded = planningMode;
+  // --- Quipal: upgrade priority rooms ---
+  if (medallions.Quipal > 0) {
+    const candidates = [];
+    for (let i = 0; i < grid.length; i++) {
+      const c = grid[i];
+      if (!c.room || c.faded) continue;
+      if (!connected.has(i)) continue;
+      if (c.tier >= 3) continue;
+      if (c.quipalUsed) continue;
+
+      const eff = getEffectiveRoomKey(i) || c.room;
+      let prio = 999;
+
+      // Priority model: Spymaster Snake value + core loot multipliers
+      if (eff === "Spymaster") prio = 1;
+      else if (eff === "LegionBarrack") prio = 2;
+      else if (eff === "SacrificialChamber") prio = 3;
+      else if (eff === "Thaumaturge") prio = 4;
+      else if (eff === "CorruptionChamber") prio = 5;
+      else if (eff === "Armoury") prio = 6;
+      else prio = 50;
+
+      candidates.push({ i, prio, eff, tier: c.tier });
+    }
+
+    candidates.sort((a,b) => a.prio - b.prio);
+
+    // Offer up to (Quipal count) actionable upgrades
+    const max = Math.min(medallions.Quipal, Math.max(1, candidates.length));
+    for (let k = 0; k < max; k++) {
+      const c = candidates[k];
+      advice.push({
+        key: `quipal-${c.i}`,
+        text: `Use Quipal to upgrade ${ROOM_NAMES[c.eff]} at (${rc(c.i).r},${rc(c.i).c}) from ${roman(c.tier)} → ${roman(c.tier+1)}.`,
+        canApply: true,
+        apply: () => {
+          if (medallions.Quipal <= 0) return;
+          if (grid[c.i].quipalUsed) { uiMessage = "Quipal already used on that room."; return; }
+          grid[c.i].tier = clampTier(grid[c.i].tier + 1);
+          grid[c.i].quipalUsed = true;
+          medallions.Quipal -= 1;
+          uiMessage = `Applied Quipal at (${rc(c.i).r},${rc(c.i).c}).`;
+        }
+      });
+    }
   }
-  if (cCount > 0) ensureCorruptionFloors(cCount - 1);
 
-  uiMessage = `Auto-built plan: Snake ${sCount} steps + Corruption ${cCount} steps (loop-free, connected at Entrance).`;
+  // --- Hand mode advice: Puaets / Uramot ---
+  if (useHandMode) {
+    // If the next needed room isn't in hand, recommend Puaets reroll
+    const nextSnake = suggestNext("snake");
+    const nextCorrupt = suggestNext("corrupt");
+
+    const needSnake = !nextSnake.ok && /Need/.test(nextSnake.reason || "");
+    const needCorrupt = !nextCorrupt.ok && /Need/.test(nextCorrupt.reason || "");
+
+    if ((needSnake || needCorrupt) && medallions.Puaets > 0) {
+      advice.push({
+        key: "puaets-reroll",
+        text: "Use Puaets to REROLL your 6 cards (your next required room isn’t in hand).",
+        canApply: true,
+        apply: () => {
+          if (medallions.Puaets <= 0) return;
+          medallions.Puaets -= 1;
+          hand = Array(6).fill(null); // clear so you can enter new hand
+          uiMessage = "Used Puaets: hand cleared. Enter your new 6 cards.";
+        }
+      });
+    }
+
+    // If next needed room isn't in hand and you have Uramot, recommend using it
+    if (medallions.Uramot > 0) {
+      // If the solver would use Uramot for the next move (it suggests ok with useUramot),
+      // show a hint.
+      const s = suggestNext("snake");
+      if (s.ok && s.move.useUramot) {
+        advice.push({
+          key: "uramot-snake",
+          text: `Use Uramot to place ${ROOM_NAMES[s.move.roomKey]} for the Snake even though it isn't in your hand.`,
+          canApply: true,
+          apply: () => { uiMessage = "Tip: click 'Auto place 1' for Snake to consume Uramot and place the missing tile."; }
+        });
+      }
+      const c = suggestNext("corrupt");
+      if (c.ok && c.move.useUramot) {
+        advice.push({
+          key: "uramot-corrupt",
+          text: `Use Uramot to place ${ROOM_NAMES[c.move.roomKey]} for the Corruption package even though it isn't in your hand.`,
+          canApply: true,
+          apply: () => { uiMessage = "Tip: click 'Auto place 1' for Corruption to consume Uramot and place the missing tile."; }
+        });
+      }
+    }
+  }
+
+  return advice;
+}
+
+/* ===============================
+   Layout helpers
+   =============================== */
+function clearAllRoomsAndFloors() {
+  grid.forEach(c => {
+    c.room = null;
+    c.floor = null;
+    c.faded = false;
+    c.tier = 1;
+    c.locked = false;
+    c.quipalUsed = false;
+  });
   suggestedMove = null;
 }
 
 function rebuildFloorsForAllPlaced() {
-  // Clear floors then rebuild snake+corruption floors for their current filled prefixes
   grid.forEach(c => c.floor = null);
 
   const sp = getSnakePath();
@@ -683,33 +888,80 @@ function rebuildFloorsForAllPlaced() {
   suggestedMove = null;
 }
 
-/* ---------- SAVE / LOAD ---------- */
+/* ===============================
+   Save / load (now includes medallions + hand)
+   =============================== */
 function saveLayout() {
-  navigator.clipboard.writeText(JSON.stringify(grid));
+  const payload = {
+    version: 2,
+    grid,
+    medallions,
+    useHandMode,
+    hand,
+    planningMode
+  };
+  navigator.clipboard.writeText(JSON.stringify(payload));
   alert("Layout copied to clipboard");
 }
 
 function loadLayout() {
   const input = prompt("Paste layout data:");
   if (!input) return;
+
   try {
     const parsed = JSON.parse(input);
+
+    // Backward compat: old saves were just grid array
     if (Array.isArray(parsed) && parsed.length === GRID_SIZE * GRID_SIZE) {
-      grid = parsed;
+      grid = parsed.map(c => ({
+        room: c.room ?? null,
+        floor: c.floor ?? null,
+        faded: !!c.faded,
+        tier: c.tier ?? 1,
+        locked: !!c.locked,
+        quipalUsed: !!c.quipalUsed
+      }));
+      uiMessage = "Loaded (legacy) layout.";
       suggestedMove = null;
+      render();
+      return;
+    }
+
+    if (parsed && parsed.grid && Array.isArray(parsed.grid) && parsed.grid.length === GRID_SIZE * GRID_SIZE) {
+      grid = parsed.grid.map(c => ({
+        room: c.room ?? null,
+        floor: c.floor ?? null,
+        faded: !!c.faded,
+        tier: c.tier ?? 1,
+        locked: !!c.locked,
+        quipalUsed: !!c.quipalUsed
+      }));
+
+      medallions = { ...medallions, ...(parsed.medallions || {}) };
+      useHandMode = !!parsed.useHandMode;
+      hand = Array.isArray(parsed.hand) ? parsed.hand.slice(0,6).concat(Array(6).fill(null)).slice(0,6) : Array(6).fill(null);
+      planningMode = !!parsed.planningMode;
+
       uiMessage = "Loaded layout.";
+      suggestedMove = null;
       render();
     }
   } catch {}
 }
 
-/* ---------- RENDER ---------- */
+/* ===============================
+   Render
+   =============================== */
 function render() {
   const app = document.getElementById("app");
   app.innerHTML = "";
 
   const container = document.createElement("div");
   container.className = "flex gap-6";
+
+  const connected = connectedFromEntrance();
+  const hasLoop = entranceHasLoop();
+  const advice = getMedallionAdvice(connected);
 
   /* ---------- GRID ---------- */
   const gridCol = document.createElement("div");
@@ -720,9 +972,6 @@ function render() {
   const gridEl = document.createElement("div");
   gridEl.id = "temple-grid";
   gridEl.className = "grid grid-cols-9 gap-2";
-
-  const connected = connectedFromEntrance();
-  const hasLoop = entranceHasLoop();
 
   grid.forEach((cell, i) => {
     const btn = document.createElement("button");
@@ -755,11 +1004,35 @@ function render() {
       r.appendChild(img);
       btn.appendChild(r);
 
-      if (!cell.faded && cell.room === "TranscendentBarracks" && eff === "LegionBarrack") {
+      // Lock badge
+      if (cell.locked) {
         const b = document.createElement("div");
         b.className = "badge";
-        b.textContent = "LEGION";
+        b.textContent = "LOCK";
         btn.appendChild(b);
+      }
+
+      // Quipal badge
+      if (cell.quipalUsed) {
+        const bq = document.createElement("div");
+        bq.className = "badge-q";
+        bq.textContent = "Q";
+        btn.appendChild(bq);
+      }
+
+      // Tier badge
+      const bt = document.createElement("div");
+      bt.className = "badge-tier";
+      bt.textContent = roman(cell.tier || 1);
+      btn.appendChild(bt);
+
+      // Conversion hint badge
+      if (!cell.faded && cell.room === "TranscendentBarracks" && eff === "LegionBarrack") {
+        const b2 = document.createElement("div");
+        b2.className = "badge";
+        b2.style.left = "26px";
+        b2.textContent = "LEGION";
+        btn.appendChild(b2);
       }
     }
 
@@ -771,12 +1044,33 @@ function render() {
     const floorText = cell.floor ? cell.floor : "(no floor)";
     const roomText = cell.room ? ROOM_NAMES[cell.room] : "(no room)";
     const effText = (cell.room && eff && eff !== cell.room) ? ` (effective: ${ROOM_NAMES[eff]})` : "";
-    btn.title = `${roomText}${effText}\nFloor: ${floorText}\nStatus: ${connText}\nPos: (${rc(i).r},${rc(i).c})`;
+    const lockText = cell.locked ? "LOCKED" : "unlocked";
+    btn.title = `${roomText}${effText}\nTier: ${roman(cell.tier || 1)}\n${lockText}\nFloor: ${floorText}\nStatus: ${connText}\nPos: (${rc(i).r},${rc(i).c})\n\nControls:\n- Shift+Click: tier up\n- Alt/Ctrl+Click: tier down\n- Right-click: clear (Shift+Right-click clears even if locked)`;
 
-    btn.onclick = () => {
+    btn.onclick = (e) => {
+      // Tier editing (only when a room exists)
+      if (!selectedRoom && !selectedFloor && cell.room) {
+        if (e.shiftKey) {
+          cell.tier = clampTier((cell.tier || 1) + 1);
+          uiMessage = `Tier up: (${rc(i).r},${rc(i).c}) is now ${roman(cell.tier)}.`;
+          render();
+          return;
+        }
+        if (e.altKey || e.ctrlKey) {
+          cell.tier = clampTier((cell.tier || 1) - 1);
+          uiMessage = `Tier down: (${rc(i).r},${rc(i).c}) is now ${roman(cell.tier)}.`;
+          render();
+          return;
+        }
+      }
+
+      // Normal placement logic
       if (selectedRoom) {
         cell.room = selectedRoom;
         cell.faded = planningMode;
+        cell.tier = 1;
+        cell.locked = false;
+        cell.quipalUsed = false;
         suggestedMove = null;
       } else if (selectedFloor) {
         cell.floor = selectedFloor;
@@ -789,8 +1083,20 @@ function render() {
 
     btn.oncontextmenu = e => {
       e.preventDefault();
+
+      // If locked, require Shift+rightclick to clear (so locks feel real)
+      if (cell.locked && !e.shiftKey) {
+        uiMessage = "That room is LOCKED. Shift+Right-click to clear anyway.";
+        render();
+        return;
+      }
+
       cell.room = null;
       cell.floor = null;
+      cell.faded = false;
+      cell.tier = 1;
+      cell.locked = false;
+      cell.quipalUsed = false;
       suggestedMove = null;
       render();
     };
@@ -833,11 +1139,9 @@ function render() {
 
   row1.append(saveBtn, loadBtn, planning, resetBtn);
 
-  /* ---- Solver controls ---- */
   const row2 = document.createElement("div");
   row2.className = "flex gap-2 flex-wrap items-center";
 
-  // Snake block
   const snakeLabel = document.createElement("div");
   snakeLabel.className = "text-sm font-semibold text-emerald-300";
   snakeLabel.textContent = "Spymaster Snake:";
@@ -845,27 +1149,13 @@ function render() {
   const snakeSuggestBtn = document.createElement("button");
   snakeSuggestBtn.textContent = "Suggest";
   snakeSuggestBtn.className = "px-3 py-1 bg-emerald-700 rounded";
-  snakeSuggestBtn.onclick = () => { setSuggestionOnly(suggestSnakeNext()); render(); };
+  snakeSuggestBtn.onclick = () => { setSuggestionOnly(suggestNext("snake")); render(); };
 
   const snakeStepBtn = document.createElement("button");
   snakeStepBtn.textContent = "Auto place 1";
   snakeStepBtn.className = "px-3 py-1 bg-emerald-700 rounded";
-  snakeStepBtn.onclick = () => { applySuggestion(suggestSnakeNext()); render(); };
+  snakeStepBtn.onclick = () => { applySuggestion(suggestNext("snake")); render(); };
 
-  const snakeN = document.createElement("input");
-  snakeN.type = "number";
-  snakeN.min = "0";
-  snakeN.max = String(getSnakePath().length);
-  snakeN.value = "12";
-  snakeN.className = "w-20 px-2 py-1 bg-zinc-800 rounded border border-zinc-700 text-sm";
-  snakeN.title = "How many Snake steps to add from first empty";
-
-  const snakeBuildBtn = document.createElement("button");
-  snakeBuildBtn.textContent = "Auto build N";
-  snakeBuildBtn.className = "px-3 py-1 bg-emerald-700 rounded";
-  snakeBuildBtn.onclick = () => { autoBuildSnake(parseInt(snakeN.value || "0", 10)); render(); };
-
-  // Corruption block
   const corruptLabel = document.createElement("div");
   corruptLabel.className = "text-sm font-semibold text-sky-300 ml-2";
   corruptLabel.textContent = "Corruption package:";
@@ -873,54 +1163,12 @@ function render() {
   const corruptSuggestBtn = document.createElement("button");
   corruptSuggestBtn.textContent = "Suggest";
   corruptSuggestBtn.className = "px-3 py-1 bg-sky-700 rounded";
-  corruptSuggestBtn.onclick = () => { setSuggestionOnly(suggestCorruptionNext()); render(); };
+  corruptSuggestBtn.onclick = () => { setSuggestionOnly(suggestNext("corrupt")); render(); };
 
   const corruptStepBtn = document.createElement("button");
   corruptStepBtn.textContent = "Auto place 1";
   corruptStepBtn.className = "px-3 py-1 bg-sky-700 rounded";
-  corruptStepBtn.onclick = () => { applySuggestion(suggestCorruptionNext()); render(); };
-
-  const corruptN = document.createElement("input");
-  corruptN.type = "number";
-  corruptN.min = "0";
-  corruptN.max = String(getCorruptionPath().length);
-  corruptN.value = String(getCorruptionPath().length);
-  corruptN.className = "w-20 px-2 py-1 bg-zinc-800 rounded border border-zinc-700 text-sm";
-  corruptN.title = "How many Corruption steps to add from first empty";
-
-  const corruptBuildBtn = document.createElement("button");
-  corruptBuildBtn.textContent = "Auto build N";
-  corruptBuildBtn.className = "px-3 py-1 bg-sky-700 rounded";
-  corruptBuildBtn.onclick = () => { autoBuildCorruption(parseInt(corruptN.value || "0", 10)); render(); };
-
-  // Combined
-  const planLabel = document.createElement("div");
-  planLabel.className = "text-sm font-semibold text-amber-300 ml-2";
-  planLabel.textContent = "Full plan:";
-
-  const planSnake = document.createElement("input");
-  planSnake.type = "number";
-  planSnake.min = "0";
-  planSnake.max = String(getSnakePath().length);
-  planSnake.value = "24";
-  planSnake.className = "w-20 px-2 py-1 bg-zinc-800 rounded border border-zinc-700 text-sm";
-  planSnake.title = "Snake steps (clears first)";
-
-  const planCorrupt = document.createElement("input");
-  planCorrupt.type = "number";
-  planCorrupt.min = "0";
-  planCorrupt.max = String(getCorruptionPath().length);
-  planCorrupt.value = String(getCorruptionPath().length);
-  planCorrupt.className = "w-20 px-2 py-1 bg-zinc-800 rounded border border-zinc-700 text-sm";
-  planCorrupt.title = "Corruption steps (clears first)";
-
-  const planBtn = document.createElement("button");
-  planBtn.textContent = "Auto build (clear)";
-  planBtn.className = "px-3 py-1 bg-amber-700 rounded";
-  planBtn.onclick = () => {
-    autoBuildPlan(parseInt(planSnake.value || "0", 10), parseInt(planCorrupt.value || "0", 10));
-    render();
-  };
+  corruptStepBtn.onclick = () => { applySuggestion(suggestNext("corrupt")); render(); };
 
   const rebuildFloorsBtn = document.createElement("button");
   rebuildFloorsBtn.textContent = "Rebuild floors";
@@ -928,9 +1176,8 @@ function render() {
   rebuildFloorsBtn.onclick = () => { rebuildFloorsForAllPlaced(); render(); };
 
   row2.append(
-    snakeLabel, snakeSuggestBtn, snakeStepBtn, snakeN, snakeBuildBtn,
-    corruptLabel, corruptSuggestBtn, corruptStepBtn, corruptN, corruptBuildBtn,
-    planLabel, planSnake, planCorrupt, planBtn,
+    snakeLabel, snakeSuggestBtn, snakeStepBtn,
+    corruptLabel, corruptSuggestBtn, corruptStepBtn,
     rebuildFloorsBtn
   );
 
@@ -951,9 +1198,191 @@ function render() {
     </div>
     <div class="mt-1">${uiMessage ? uiMessage : ""}</div>
     <div class="mt-1">Red outline = room not connected to Entrance (would not “exist” per the transcript rule).</div>
+    <div class="mt-1">Tier edit: Shift+Click tier up | Alt/Ctrl+Click tier down | LOCK requires Shift+Right-click to clear.</div>
   `;
 
-  controls.append(row1, row2, status);
+  /* ---------- Medallions panel ---------- */
+  const medBox = document.createElement("div");
+  medBox.className = "mt-3 p-3 bg-zinc-800 rounded border border-zinc-700";
+
+  const medTitle = document.createElement("div");
+  medTitle.className = "font-semibold mb-2 text-amber-300";
+  medTitle.textContent = "Medallions (Loadout + Advice)";
+
+  const medRow = document.createElement("div");
+  medRow.className = "grid grid-cols-2 gap-2";
+
+  function medInput(key, label) {
+    const wrap = document.createElement("label");
+    wrap.className = "text-xs flex items-center justify-between gap-2 bg-zinc-900 border border-zinc-700 rounded px-2 py-2";
+    const t = document.createElement("div");
+    t.textContent = label;
+
+    const inp = document.createElement("input");
+    inp.type = "number";
+    inp.min = "0";
+    inp.value = String(medallions[key] ?? 0);
+    inp.className = "w-20 px-2 py-1 bg-zinc-800 rounded border border-zinc-700 text-xs";
+    inp.onchange = (e) => {
+      medallions[key] = Math.max(0, parseInt(e.target.value || "0", 10));
+      render();
+    };
+
+    wrap.append(t, inp);
+    return wrap;
+  }
+
+  medRow.append(
+    medInput("Jatalot", "Jatalot (Lock)"),
+    medInput("Quipal", "Quipal (+1 Tier)"),
+    medInput("Puaets", "Puaets (Reroll Hand)"),
+    medInput("Uramot", "Uramot (Place Missing)"),
+    medInput("Zopex", "Zopex (Meta)"),
+    medInput("Ascappers", "Ascappers (Meta)")
+  );
+
+  const handRow = document.createElement("div");
+  handRow.className = "mt-3";
+
+  const handToggle = document.createElement("label");
+  handToggle.className = "text-xs flex items-center gap-2";
+  const ht = document.createElement("input");
+  ht.type = "checkbox";
+  ht.checked = useHandMode;
+  ht.onchange = (e) => { useHandMode = e.target.checked; render(); };
+  handToggle.append(ht, document.createTextNode("Hand (6 cards) mode — solver only suggests what you can place (unless Uramot)."));
+
+  handRow.appendChild(handToggle);
+
+  const handGrid = document.createElement("div");
+  handGrid.className = "grid grid-cols-3 gap-2 mt-2";
+  handGrid.style.display = useHandMode ? "grid" : "none";
+
+  const roomKeys = [null, ...Object.keys(ROOM_NAMES)];
+  function roomSelect(slot) {
+    const sel = document.createElement("select");
+    sel.className = "w-full bg-zinc-900 border border-zinc-700 rounded px-2 py-2 text-xs";
+    for (const k of roomKeys) {
+      const opt = document.createElement("option");
+      opt.value = k ?? "";
+      opt.textContent = k ? ROOM_NAMES[k] : "(empty)";
+      sel.appendChild(opt);
+    }
+    sel.value = hand[slot] ?? "";
+    sel.onchange = (e) => { hand[slot] = e.target.value || null; render(); };
+    return sel;
+  }
+
+  for (let i = 0; i < 6; i++) handGrid.appendChild(roomSelect(i));
+
+  const handBtns = document.createElement("div");
+  handBtns.className = "flex gap-2 mt-2";
+  handBtns.style.display = useHandMode ? "flex" : "none";
+
+  const clearHandBtn = document.createElement("button");
+  clearHandBtn.className = "px-3 py-1 bg-zinc-700 rounded text-xs";
+  clearHandBtn.textContent = "Clear hand";
+  clearHandBtn.onclick = () => { hand = Array(6).fill(null); uiMessage = "Hand cleared."; render(); };
+
+  handBtns.appendChild(clearHandBtn);
+
+  const adviceTitle = document.createElement("div");
+  adviceTitle.className = "mt-3 font-semibold text-xs text-emerald-300";
+  adviceTitle.textContent = "Advice (click Apply to consume medallions / change board)";
+
+  const adviceList = document.createElement("div");
+  adviceList.className = "mt-2 flex flex-col gap-2";
+
+  if (advice.length === 0) {
+    const none = document.createElement("div");
+    none.className = "text-xs opacity-70";
+    none.textContent = "No medallion actions suggested right now.";
+    adviceList.appendChild(none);
+  } else {
+    advice.forEach(a => {
+      const item = document.createElement("div");
+      item.className = "flex items-center justify-between gap-2 bg-zinc-900 border border-zinc-700 rounded px-2 py-2";
+
+      const txt = document.createElement("div");
+      txt.className = "text-xs";
+      txt.textContent = a.text;
+
+      const btn = document.createElement("button");
+      btn.className = "px-2 py-1 bg-emerald-700 rounded text-xs";
+      btn.textContent = "Apply";
+      btn.disabled = !a.canApply;
+      btn.onclick = () => { a.apply(); render(); };
+
+      item.append(txt, btn);
+      adviceList.appendChild(item);
+    });
+  }
+
+  medBox.append(medTitle, medRow, handRow, handGrid, handBtns, adviceTitle, adviceList);
+
+  /* ---------- Tutorial ---------- */
+  const tutBox = document.createElement("div");
+  tutBox.className = "mt-3 p-3 bg-zinc-800 rounded border border-zinc-700";
+
+  const tutHeader = document.createElement("button");
+  tutHeader.className = "w-full flex items-center justify-between text-left";
+  tutHeader.onclick = () => { tutorialOpen = !tutorialOpen; render(); };
+
+  const tutTitle = document.createElement("div");
+  tutTitle.className = "font-semibold text-amber-300";
+  tutTitle.textContent = "Tutorial / Button Guide (click to toggle)";
+
+  const tutState = document.createElement("div");
+  tutState.className = "text-xs opacity-70";
+  tutState.textContent = tutorialOpen ? "Hide" : "Show";
+
+  tutHeader.append(tutTitle, tutState);
+
+  const tutBody = document.createElement("div");
+  tutBody.style.display = tutorialOpen ? "block" : "none";
+  tutBody.className = "mt-2 text-xs leading-relaxed";
+
+  tutBody.innerHTML = `
+    <div class="mini">
+      <div class="font-semibold text-zinc-100 mb-1">Step-by-step (Spymaster Snake strategy)</div>
+      <ol class="list-decimal ml-5">
+        <li><b>Set your Medallion loadout</b> in the Medallions panel (Jatalot / Quipal are the big ones).</li>
+        <li>(Optional) Enable <b>Hand mode</b> and enter the 6 cards you actually drew. Solver suggestions will respect it.</li>
+        <li>Build the <b>Snake chain</b> (Armoury → Barracks → Spymaster → Barracks …):
+          use <b>Suggest</b> to see the next placement, and <b>Auto place 1</b> to place it.</li>
+        <li>Build the <b>Corruption package branch</b> on the right:
+          use <b>Suggest</b> / <b>Auto place 1</b> for Corruption.</li>
+        <li>Watch the status line:
+          <b>Loop DETECTED</b> means you made a cycle (bad per transcript “loops = lose”).</li>
+        <li><b>Red outline</b> means a room is not connected to the Entrance via floors, so it “doesn’t exist”.</li>
+        <li>Use the <b>Advice</b> list to apply Jatalot/Quipal at the right time (it will consume from your loadout).</li>
+      </ol>
+
+      <div class="font-semibold text-zinc-100 mt-3 mb-1">What each solver button does</div>
+      <ul class="list-disc ml-5">
+        <li><b>Suggest</b>: highlights the next intended cell for the selected chain (Snake or Corruption).</li>
+        <li><b>Auto place 1</b>: places that suggestion, builds the corridor floors automatically, and (in Hand mode) consumes the card (or Uramot).</li>
+        <li><b>Rebuild floors</b>: clears & recreates corridor floors for the currently-filled prefixes of Snake/Corruption.</li>
+        <li><b>Clear all</b>: wipes all rooms + floors.</li>
+      </ul>
+
+      <div class="font-semibold text-zinc-100 mt-3 mb-1">Room tiers</div>
+      <ul class="list-disc ml-5">
+        <li>Each room shows <b>I/II/III</b> on the tile.</li>
+        <li><b>Shift+Click</b> upgrades tier, <b>Alt/Ctrl+Click</b> downgrades tier.</li>
+        <li><b>Quipal</b> in Advice upgrades by +1 tier and marks the room with <b>Q</b> (can only be used once per room).</li>
+      </ul>
+
+      <div class="font-semibold text-zinc-100 mt-3 mb-1">Locks</div>
+      <ul class="list-disc ml-5">
+        <li><b>LOCK</b> badge = protected (Jatalot). Right-click won’t clear unless you use <b>Shift+Right-click</b>.</li>
+      </ul>
+    </div>
+  `;
+
+  tutBox.append(tutHeader, tutBody);
+
+  controls.append(row1, row2, status, medBox, tutBox);
   gridCol.appendChild(controls);
 
   /* ---------- FLOOR PALETTE ---------- */
@@ -1011,35 +1440,43 @@ function render() {
   bonusCol.className = "w-72";
   bonusCol.innerHTML = "<h2 class='font-semibold mb-2'>Active Bonuses (Connected Only)</h2>";
 
-  const counts = {};
+  // Count boosters (connected + active)
   const boosters = {};
-  const boostReport = [];
+  grid.forEach((c, i) => {
+    if (!c.room || c.faded) return;
+    if (!connected.has(i)) return;
+    if (BOOST_RULES[c.room]) boosters[c.room] = (boosters[c.room] || 0) + 1;
+  });
 
-  // IMPORTANT: only count rooms that are active AND connected to Entrance
+  // Counts per effective room:
+  // - flatCount: number of rooms (for ITEM/ADD/MEDALLION lines)
+  // - percentCount: sum of tierPercentFactor (so tier affects % lines)
+  const counts = {};
   grid.forEach((c, i) => {
     if (!c.room || c.faded) return;
     if (!connected.has(i)) return;
 
-    const effective = getEffectiveRoomKey(i) || c.room;
+    const eff = getEffectiveRoomKey(i) || c.room;
 
-    if (ROOM_TILES[effective]) counts[effective] = (counts[effective] || 0) + 1;
-    if (BOOST_RULES && BOOST_RULES[c.room]) boosters[c.room] = (boosters[c.room] || 0) + 1;
+    counts[eff] ??= { flat: 0, percent: 0 };
+    counts[eff].flat += 1;
+    counts[eff].percent += tierPercentFactor(c.tier || 1);
   });
 
   const grouped = {};
+  const boostReport = [];
 
-  Object.entries(counts).forEach(([room, base]) => {
+  Object.entries(counts).forEach(([room, obj]) => {
     let mult = 1;
     Object.entries(boosters).forEach(([b, n]) => {
       const rule = BOOST_RULES[b];
       if (rule.targets.includes(room)) mult += rule.amount * n;
     });
 
-    if (mult > 1) {
-      boostReport.push(`${ROOM_NAMES[room]}: +${Math.round((mult - 1) * 100)}% (included)`);
-    }
+    if (mult > 1) boostReport.push(`${ROOM_NAMES[room]}: +${Math.round((mult - 1) * 100)}% (included on % effects)`);
 
-    formatBonuses(room, base * mult).forEach(text => {
+    // Apply mult ONLY to % effects (countPercent). Flat stays flat.
+    formatBonuses(room, obj.percent * mult, obj.flat).forEach(text => {
       const cat = categoryOf(text);
       grouped[cat] ??= [];
       grouped[cat].push(text);
@@ -1079,7 +1516,6 @@ function render() {
     bonusCol.appendChild(d);
   }
 
-  /* ---------- APPEND ALL ---------- */
   container.append(gridCol, roomCol, bonusCol);
   app.appendChild(container);
 }
