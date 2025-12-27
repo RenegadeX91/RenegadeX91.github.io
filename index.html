@@ -94,26 +94,30 @@
     pointer-events: none;
   }
 
-  /* Tier +/- controls (appear on hover) */
+  /* Tier +/- controls (always in DOM; fade in on hover to avoid "vanishing") */
   .tier-controls {
     position: absolute;
+    top: 2px;          /* INSIDE the cell so hover doesn't drop */
     left: 50%;
-    top: -10px;
-    transform: translateX(-50%);
     z-index: 4;
-    display: none;
+    display: flex;
     gap: 4px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.10s ease;
+  }
+  .cell:hover .tier-controls {
+    opacity: 1;
     pointer-events: auto;
   }
-  .cell:hover .tier-controls { display: flex; }
 
   .tier-btn {
     width: 18px;
     height: 18px;
     border-radius: 999px;
     border: 1px solid rgba(255,255,255,0.25);
-    background: rgba(0,0,0,0.65);
-    color: rgba(255,255,255,0.9);
+    background: rgba(0,0,0,0.70);
+    color: rgba(255,255,255,0.95);
     font-size: 12px;
     line-height: 16px;
     font-weight: 700;
@@ -121,8 +125,9 @@
     align-items: center;
     justify-content: center;
     cursor: pointer;
+    user-select: none;
   }
-  .tier-btn:hover { border-color: rgba(255,255,255,0.45); }
+  .tier-btn:hover { border-color: rgba(255,255,255,0.55); }
 
   /* =========================
      Diamond / 45° grid view
@@ -139,13 +144,18 @@
     transform-origin: center;
   }
 
-  /* Keep icons/badges/controls upright */
+  /* Keep icons/badges upright */
   #temple-grid .room,
   #temple-grid .badge,
   #temple-grid .badge-tier,
-  #temple-grid .badge-q,
-  #temple-grid .tier-controls {
+  #temple-grid .badge-q {
     transform: rotate(-45deg);
+    transform-origin: center;
+  }
+
+  /* IMPORTANT: tier-controls needs translateX + rotate (avoid transform override bug) */
+  #temple-grid .tier-controls {
+    transform: translateX(-50%) rotate(-45deg);
     transform-origin: center;
   }
 
@@ -185,6 +195,12 @@ let medallions = {
 };
 
 let useHandMode = false;
+let consumeFloorsForAuto = false; // NEW: optionally consume floor tiles when solver auto-paths
+
+// 6-card hand. Each entry can be:
+// - room key (e.g. "Armoury")
+// - floor key (e.g. "FLOOR:URDL")
+// - null
 let hand = Array(6).fill(null);
 
 /* ----------------------------
@@ -403,13 +419,13 @@ function dirsToTileString(dirSet) {
   const key = [...dirSet].sort().join("");
   return FLOOR_KEY_TO_TILE[key] ?? null;
 }
-function addOpen(i, dir) {
-  const cur = grid[i].floor;
+function addOpenOnMap(floorMap, i, dir) {
+  const cur = floorMap[i] || null;
   const set = new Set(cur ? [...cur] : []);
   set.add(dir);
-  grid[i].floor = dirsToTileString(set);
+  floorMap[i] = dirsToTileString(set);
 }
-function connectCells(a, b) {
+function connectCellsOnMap(floorMap, a, b) {
   const ar = rc(a), br = rc(b);
   const dr = br.r - ar.r;
   const dc = br.c - ar.c;
@@ -421,8 +437,8 @@ function connectCells(a, b) {
   else if (dr === 0 && dc === -1) dir = "L";
   if (!dir) return;
 
-  addOpen(a, dir);
-  addOpen(b, DIRS[dir].opp);
+  addOpenOnMap(floorMap, a, dir);
+  addOpenOnMap(floorMap, b, DIRS[dir].opp);
 }
 
 /* ===============================
@@ -443,16 +459,54 @@ function getEffectiveRoomKey(i) {
 /* ===============================
    Hand helpers
    =============================== */
+function cardLabel(x) {
+  if (!x) return "(empty)";
+  if (x.startsWith("FLOOR:")) return `Path Tile: ${x.slice(6)}`;
+  return ROOM_NAMES[x] || x;
+}
+
 function handCounts() {
   const m = {};
-  for (const x of hand) { if (!x) continue; m[x] = (m[x] || 0) + 1; }
+  for (const x of hand) {
+    if (!x) continue;
+    m[x] = (m[x] || 0) + 1;
+  }
   return m;
 }
-function consumeFromHand(roomKey) {
+
+function consumeCard(cardKey) {
   for (let i = 0; i < hand.length; i++) {
-    if (hand[i] === roomKey) { hand[i] = null; return true; }
+    if (hand[i] === cardKey) {
+      hand[i] = null;
+      return true;
+    }
   }
   return false;
+}
+
+function payForMissingCards(requiredCards) {
+  // requiredCards: array of exact keys e.g. ["Armoury", "FLOOR:UR", ...]
+  const counts = handCounts();
+  let missing = 0;
+  for (const k of requiredCards) {
+    if (!k) continue;
+    if ((counts[k] || 0) > 0) counts[k] -= 1;
+    else missing += 1;
+  }
+  if (missing > medallions.Uramot) return { ok: false, missing };
+  return { ok: true, missing };
+}
+
+function consumeForRequiredCards(requiredCards) {
+  // consume from hand if possible, otherwise consume Uramot as wildcard
+  for (const k of requiredCards) {
+    if (!k) continue;
+    if (!consumeCard(k)) {
+      if (medallions.Uramot > 0) medallions.Uramot -= 1;
+      else return false;
+    }
+  }
+  return true;
 }
 
 /* ===============================
@@ -481,12 +535,6 @@ function snakeFirstEmptyStep() {
   for (let step = 0; step < path.length; step++) if (!grid[path[step]].room) return step;
   return null;
 }
-function ensureSnakeFloors(uptoStepInclusive) {
-  const path = getSnakePath();
-  if (uptoStepInclusive === null || uptoStepInclusive < 0) return;
-  connectCells(entranceIndex(), path[0]);
-  for (let step = 0; step < uptoStepInclusive; step++) connectCells(path[step], path[step + 1]);
-}
 function validateSnakePrefix() {
   const path = getSnakePath();
   const mismatches = [];
@@ -514,7 +562,10 @@ function getCorruptionPath() {
     { r: GRID_SIZE - 5, c: 5 },
     { r: GRID_SIZE - 6, c: 5 },
   ];
-  cachedCorrupt = coords.filter(p => inBounds(p.r, p.c)).map(p => idx(p.r, p.c)).filter(i => i !== entranceIndex());
+  cachedCorrupt = coords
+    .filter(p => inBounds(p.r, p.c))
+    .map(p => idx(p.r, p.c))
+    .filter(i => i !== entranceIndex());
   return cachedCorrupt;
 }
 function expectedCorruptRoom(step) { return CORRUPT_PATTERN[step % CORRUPT_PATTERN.length]; }
@@ -522,12 +573,6 @@ function corruptFirstEmptyStep() {
   const path = getCorruptionPath();
   for (let step = 0; step < path.length; step++) if (!grid[path[step]].room) return step;
   return null;
-}
-function ensureCorruptionFloors(uptoStepInclusive) {
-  const path = getCorruptionPath();
-  if (uptoStepInclusive === null || uptoStepInclusive < 0) return;
-  connectCells(entranceIndex(), path[0]);
-  for (let step = 0; step < uptoStepInclusive; step++) connectCells(path[step], path[step + 1]);
 }
 function validateCorruptionPrefix() {
   const path = getCorruptionPath();
@@ -540,6 +585,73 @@ function validateCorruptionPrefix() {
     if (room !== exp) mismatches.push({ step, index: i, expected: exp, found: room });
   }
   return mismatches;
+}
+
+/* ===============================
+   Auto-floor planning (hand-aware)
+   =============================== */
+function planFloorsForSnake(uptoStepInclusive) {
+  const floorMap = {};
+  for (let i = 0; i < grid.length; i++) floorMap[i] = grid[i].floor || null;
+
+  const path = getSnakePath();
+  if (uptoStepInclusive === null || uptoStepInclusive < 0) return floorMap;
+
+  // Entrance -> first snake tile
+  connectCellsOnMap(floorMap, entranceIndex(), path[0]);
+  // Along snake
+  for (let step = 0; step < uptoStepInclusive; step++) connectCellsOnMap(floorMap, path[step], path[step + 1]);
+
+  return floorMap;
+}
+
+function planFloorsForCorruption(uptoStepInclusive) {
+  const floorMap = {};
+  for (let i = 0; i < grid.length; i++) floorMap[i] = grid[i].floor || null;
+
+  const path = getCorruptionPath();
+  if (uptoStepInclusive === null || uptoStepInclusive < 0) return floorMap;
+
+  connectCellsOnMap(floorMap, entranceIndex(), path[0]);
+  for (let step = 0; step < uptoStepInclusive; step++) connectCellsOnMap(floorMap, path[step], path[step + 1]);
+
+  return floorMap;
+}
+
+function floorsDeltaAsRequiredCards(newFloorMap) {
+  // Returns list of required floor cards for changed cells (approx model).
+  const req = [];
+  for (let i = 0; i < grid.length; i++) {
+    const oldF = grid[i].floor || null;
+    const newF = newFloorMap[i] || null;
+    if (newF === oldF) continue;
+    if (!newF) continue; // clearing floors doesn't cost
+    req.push(`FLOOR:${newF}`);
+  }
+  return req;
+}
+
+function applyFloorPlan(newFloorMap, requiredCards) {
+  // Optionally consume from hand (or Uramot wildcard), then apply the floors.
+  if (useHandMode && consumeFloorsForAuto) {
+    const pay = payForMissingCards(requiredCards);
+    if (!pay.ok) {
+      uiMessage = `Not enough pathing tiles in hand. Missing ${pay.missing} tile(s) and only have ${medallions.Uramot} Uramot wildcard(s).`;
+      return false;
+    }
+    if (!consumeForRequiredCards(requiredCards)) {
+      uiMessage = "Failed to consume required floor cards.";
+      return false;
+    }
+  }
+
+  for (let i = 0; i < grid.length; i++) {
+    const oldF = grid[i].floor || null;
+    const newF = newFloorMap[i] || null;
+    if (newF === oldF) continue;
+    grid[i].floor = newF;
+  }
+  return true;
 }
 
 /* ---- Hand-aware suggestions ---- */
@@ -556,7 +668,7 @@ function suggestNext(kind) {
       const counts = handCounts();
       if ((counts[roomKey] || 0) > 0) return { ok: true, move: { kind, index: i, step, roomKey, fromHand: true }, warn: mismatches.length ? mismatches : null };
       if (medallions.Uramot > 0) return { ok: true, move: { kind, index: i, step, roomKey, useUramot: true }, warn: mismatches.length ? mismatches : null };
-      return { ok: false, reason: `Need ${ROOM_NAMES[roomKey]} but it isn't in your hand. Use Puaets to reroll, or Uramot to place anyway.` };
+      return { ok: false, reason: `Need ${ROOM_NAMES[roomKey]} but it isn't in your hand. Use Puaets to reroll, or Uramot wildcard to place anyway.` };
     }
 
     return { ok: true, move: { kind, index: i, step, roomKey }, warn: mismatches.length ? mismatches : null };
@@ -574,7 +686,7 @@ function suggestNext(kind) {
       const counts = handCounts();
       if ((counts[roomKey] || 0) > 0) return { ok: true, move: { kind, index: i, step, roomKey, fromHand: true }, warn: mismatches.length ? mismatches : null };
       if (medallions.Uramot > 0) return { ok: true, move: { kind, index: i, step, roomKey, useUramot: true }, warn: mismatches.length ? mismatches : null };
-      return { ok: false, reason: `Need ${ROOM_NAMES[roomKey]} but it isn't in your hand. Use Puaets to reroll, or Uramot to place anyway.` };
+      return { ok: false, reason: `Need ${ROOM_NAMES[roomKey]} but it isn't in your hand. Use Puaets to reroll, or Uramot wildcard to place anyway.` };
     }
 
     return { ok: true, move: { kind, index: i, step, roomKey }, warn: mismatches.length ? mismatches : null };
@@ -598,8 +710,8 @@ function setSuggestionOnly(s) {
 
 function applySuggestion(s) {
   if (!s.ok) { uiMessage = s.reason; suggestedMove = null; return; }
-
   suggestedMove = s.move;
+
   const { kind, index, step, roomKey, fromHand, useUramot } = s.move;
 
   if (grid[index].room && grid[index].room !== roomKey) {
@@ -607,11 +719,12 @@ function applySuggestion(s) {
     return;
   }
 
+  // Pay for room card in hand-mode
   if (useHandMode) {
     if (fromHand) {
-      if (!consumeFromHand(roomKey)) { uiMessage = `Internal: couldn't consume ${ROOM_NAMES[roomKey]} from hand.`; return; }
+      if (!consumeCard(roomKey)) { uiMessage = `Couldn't consume ${ROOM_NAMES[roomKey]} from hand.`; return; }
     } else if (useUramot) {
-      if (medallions.Uramot <= 0) { uiMessage = "No Uramot medallions available."; return; }
+      if (medallions.Uramot <= 0) { uiMessage = "No Uramot wildcard available."; return; }
       medallions.Uramot -= 1;
     } else {
       uiMessage = "Internal: hand-mode move must be fromHand or useUramot.";
@@ -619,14 +732,22 @@ function applySuggestion(s) {
     }
   }
 
+  // Place room
   grid[index].room = roomKey;
   grid[index].faded = planningMode;
   grid[index].tier = 1;
   grid[index].locked = false;
   grid[index].quipalUsed = false;
 
-  if (kind === "snake") ensureSnakeFloors(step);
-  if (kind === "corrupt") ensureCorruptionFloors(step);
+  // Apply floors (hand-aware if enabled)
+  let floorPlan = null;
+  if (kind === "snake") floorPlan = planFloorsForSnake(step);
+  if (kind === "corrupt") floorPlan = planFloorsForCorruption(step);
+
+  if (floorPlan) {
+    const requiredFloorCards = floorsDeltaAsRequiredCards(floorPlan);
+    if (!applyFloorPlan(floorPlan, requiredFloorCards)) { render(); return; }
+  }
 
   const warn = s.warn || [];
   if (warn.length) {
@@ -638,7 +759,7 @@ function applySuggestion(s) {
 }
 
 /* ===============================
-   Medallion advice engine
+   Medallion advice engine (with crash fix)
    =============================== */
 function findIndices(predicate) {
   const out = [];
@@ -649,6 +770,7 @@ function findIndices(predicate) {
 function getMedallionAdvice(connected) {
   const advice = [];
 
+  // Jatalot: lock key rooms
   if (medallions.Jatalot > 0) {
     const snakeRoot = getSnakePath()[0];
     const corruptRoot = getCorruptionPath()[0];
@@ -695,9 +817,7 @@ function getMedallionAdvice(connected) {
     }
   }
 
-  // ✅ FIXED CRASH + SAFETY CAPS:
-  // - don't force max>=1 when candidates is empty (that caused candidates[0] undefined)
-  // - cap suggestion count to avoid huge UI render if you set Quipal to 999
+  // Quipal: upgrade suggestions (CRASH FIX + cap)
   if (medallions.Quipal > 0) {
     const candidates = [];
     for (let i = 0; i < grid.length; i++) {
@@ -722,12 +842,14 @@ function getMedallionAdvice(connected) {
 
     candidates.sort((a,b) => a.prio - b.prio);
 
-    const max = Math.min(medallions.Quipal, candidates.length, 10); // <= important
+    const max = Math.min(medallions.Quipal, candidates.length, 10);
     for (let k = 0; k < max; k++) {
       const c = candidates[k];
+      const name = ROOM_NAMES[c.eff] || c.eff;
+
       advice.push({
         key: `quipal-${c.i}`,
-        text: `Use Quipal to upgrade ${ROOM_NAMES[c.eff]} at (${rc(c.i).r},${rc(c.i).c}) from ${roman(c.tier)} → ${roman(c.tier+1)}.`,
+        text: `Use Quipal to upgrade ${name} at (${rc(c.i).r},${rc(c.i).c}) from ${roman(c.tier)} → ${roman(c.tier+1)}.`,
         canApply: true,
         apply: () => {
           if (medallions.Quipal <= 0) return;
@@ -741,10 +863,10 @@ function getMedallionAdvice(connected) {
     }
   }
 
+  // Hand-mode: recommend Puaets reroll if blocked
   if (useHandMode) {
     const nextSnake = suggestNext("snake");
     const nextCorrupt = suggestNext("corrupt");
-
     const needSnake = !nextSnake.ok && /Need/.test(nextSnake.reason || "");
     const needCorrupt = !nextCorrupt.ok && /Need/.test(nextCorrupt.reason || "");
 
@@ -760,27 +882,6 @@ function getMedallionAdvice(connected) {
           uiMessage = "Used Puaets: hand cleared. Enter your new 6 cards.";
         }
       });
-    }
-
-    if (medallions.Uramot > 0) {
-      const s = suggestNext("snake");
-      if (s.ok && s.move.useUramot) {
-        advice.push({
-          key: "uramot-snake",
-          text: `Use Uramot to place ${ROOM_NAMES[s.move.roomKey]} for the Snake even though it isn't in your hand.`,
-          canApply: true,
-          apply: () => { uiMessage = "Tip: click 'Auto place 1' for Snake to consume Uramot and place the missing tile."; }
-        });
-      }
-      const c = suggestNext("corrupt");
-      if (c.ok && c.move.useUramot) {
-        advice.push({
-          key: "uramot-corrupt",
-          text: `Use Uramot to place ${ROOM_NAMES[c.move.roomKey]} for the Corruption package even though it isn't in your hand.`,
-          canApply: true,
-          apply: () => { uiMessage = "Tip: click 'Auto place 1' for Corruption to consume Uramot and place the missing tile."; }
-        });
-      }
     }
   }
 
@@ -801,31 +902,73 @@ function clearAllRoomsAndFloors() {
   });
   suggestedMove = null;
 }
+
 function rebuildFloorsForAllPlaced() {
-  grid.forEach(c => c.floor = null);
+  // clear then rebuild floors based on currently placed prefixes
+  const snakePath = getSnakePath();
+  let snakeUpto = -1;
+  for (let step = 0; step < snakePath.length; step++) {
+    if (!grid[snakePath[step]].room) break;
+    snakeUpto = step;
+  }
 
-  const sp = getSnakePath();
-  let sUpto = -1;
-  for (let step = 0; step < sp.length; step++) { if (!grid[sp[step]].room) break; sUpto = step; }
-  if (sUpto >= 0) ensureSnakeFloors(sUpto);
+  const corruptPath = getCorruptionPath();
+  let corruptUpto = -1;
+  for (let step = 0; step < corruptPath.length; step++) {
+    if (!grid[corruptPath[step]].room) break;
+    corruptUpto = step;
+  }
 
-  const cp = getCorruptionPath();
-  let cUpto = -1;
-  for (let step = 0; step < cp.length; step++) { if (!grid[cp[step]].room) break; cUpto = step; }
-  if (cUpto >= 0) ensureCorruptionFloors(cUpto);
+  // build floor plan from scratch (ignores current floors)
+  const newFloorMap = {};
+  for (let i = 0; i < grid.length; i++) newFloorMap[i] = null;
 
-  uiMessage = "Rebuilt floors for currently filled Snake + Corruption prefixes.";
+  if (snakeUpto >= 0) {
+    const tmp = {};
+    for (let i = 0; i < grid.length; i++) tmp[i] = newFloorMap[i];
+    const p = getSnakePath();
+    connectCellsOnMap(tmp, entranceIndex(), p[0]);
+    for (let step = 0; step < snakeUpto; step++) connectCellsOnMap(tmp, p[step], p[step + 1]);
+    for (let i = 0; i < grid.length; i++) newFloorMap[i] = tmp[i];
+  }
+
+  if (corruptUpto >= 0) {
+    const tmp = {};
+    for (let i = 0; i < grid.length; i++) tmp[i] = newFloorMap[i];
+    const p = getCorruptionPath();
+    connectCellsOnMap(tmp, entranceIndex(), p[0]);
+    for (let step = 0; step < corruptUpto; step++) connectCellsOnMap(tmp, p[step], p[step + 1]);
+    for (let i = 0; i < grid.length; i++) newFloorMap[i] = tmp[i];
+  }
+
+  // if consuming floors for auto, charge for all non-null tiles (since we rebuild)
+  let required = [];
+  if (useHandMode && consumeFloorsForAuto) {
+    // treat as "set floors from scratch": require for any non-null floor set
+    for (let i = 0; i < grid.length; i++) {
+      const newF = newFloorMap[i];
+      if (!newF) continue;
+      // only charge if it actually changes from current
+      if ((grid[i].floor || null) !== newF) required.push(`FLOOR:${newF}`);
+    }
+  }
+
+  // Apply (will also consume if enabled)
+  if (!applyFloorPlan(newFloorMap, required)) return;
+
+  uiMessage = "Rebuilt floors for placed Snake + Corruption prefixes.";
   suggestedMove = null;
 }
 
 /* ===============================
-   Save / load (includes medallions + hand)
+   Save / load (includes medallions + hand + floor settings)
    =============================== */
 function saveLayout() {
-  const payload = { version: 3, grid, medallions, useHandMode, hand, planningMode };
+  const payload = { version: 4, grid, medallions, useHandMode, consumeFloorsForAuto, hand, planningMode };
   navigator.clipboard.writeText(JSON.stringify(payload));
   alert("Layout copied to clipboard");
 }
+
 function loadLayout() {
   const input = prompt("Paste layout data:");
   if (!input) return;
@@ -833,6 +976,7 @@ function loadLayout() {
   try {
     const parsed = JSON.parse(input);
 
+    // legacy: raw grid array
     if (Array.isArray(parsed) && parsed.length === GRID_SIZE * GRID_SIZE) {
       grid = parsed.map(c => ({
         room: c.room ?? null,
@@ -860,6 +1004,7 @@ function loadLayout() {
 
       medallions = { ...medallions, ...(parsed.medallions || {}) };
       useHandMode = !!parsed.useHandMode;
+      consumeFloorsForAuto = !!parsed.consumeFloorsForAuto;
       hand = Array.isArray(parsed.hand) ? parsed.hand.slice(0,6).concat(Array(6).fill(null)).slice(0,6) : Array(6).fill(null);
       planningMode = !!parsed.planningMode;
 
@@ -882,7 +1027,11 @@ function render() {
 
   const connected = connectedFromEntrance();
   const hasLoop = entranceHasLoop();
-  const advice = getMedallionAdvice(connected);
+
+  // Advice can never hard-crash the page now
+  let advice = [];
+  try { advice = getMedallionAdvice(connected); }
+  catch (e) { uiMessage = "Error in medallion advice engine. Check console."; console.error(e); advice = []; }
 
   const gridCol = document.createElement("div");
 
@@ -901,6 +1050,7 @@ function render() {
     if (i === entranceIndex()) btn.classList.add("ring-2","ring-sky-400");
     if (suggestedMove && i === suggestedMove.index) btn.classList.add("ring-2","ring-amber-400");
     if (cell.room && !connected.has(i)) btn.classList.add("ring-2","ring-red-500");
+    if (cell.locked) btn.classList.add("ring-1","ring-amber-200");
 
     if (cell.floor) {
       const f = document.createElement("div");
@@ -908,10 +1058,8 @@ function render() {
       btn.appendChild(f);
     }
 
+    // Tier controls only if there is a room
     if (cell.room) {
-      const eff = getEffectiveRoomKey(i) || cell.room;
-
-      // +/- tier controls (visible on hover)
       const tc = document.createElement("div");
       tc.className = "tier-controls";
 
@@ -943,6 +1091,8 @@ function render() {
 
       tc.append(minus, plus);
       btn.appendChild(tc);
+
+      const eff = getEffectiveRoomKey(i) || cell.room;
 
       const r = document.createElement("div");
       r.className = "room";
@@ -984,13 +1134,14 @@ function render() {
     const eff = getEffectiveRoomKey(i);
     const connText = cell.room ? (connected.has(i) ? "connected" : "DISCONNECTED") : "empty";
     const floorText = cell.floor ? cell.floor : "(no floor)";
-    const roomText = cell.room ? ROOM_NAMES[cell.room] : "(no room)";
-    const effText = (cell.room && eff && eff !== cell.room) ? ` (effective: ${ROOM_NAMES[eff]})` : "";
+    const roomText = cell.room ? (ROOM_NAMES[cell.room] || cell.room) : "(no room)";
+    const effText = (cell.room && eff && eff !== cell.room) ? ` (effective: ${ROOM_NAMES[eff] || eff})` : "";
     const lockText = cell.locked ? "LOCKED" : "unlocked";
-    btn.title = `${roomText}${effText}\nTier: ${roman(cell.tier || 1)}\n${lockText}\nFloor: ${floorText}\nStatus: ${connText}\nPos: (${rc(i).r},${rc(i).c})\n\nControls:\n- Shift+Click: tier up\n- Alt+Click: tier down\n- Hover: +/- buttons\n- Right-click: clear (Shift+Right-click clears even if locked)`;
+    btn.title =
+      `${roomText}${effText}\nTier: ${roman(cell.tier || 1)}\n${lockText}\nFloor: ${floorText}\nStatus: ${connText}\nPos: (${rc(i).r},${rc(i).c})\n\nControls:\n- Shift+Click: tier up\n- Alt+Click: tier down\n- Hover: +/- buttons\n- Right-click: clear (Shift+Right-click clears even if locked)`;
 
-    // Tier editing always wins if a room exists
     btn.onclick = (e) => {
+      // Tier editing always wins if a room exists
       if (cell.room && (e.shiftKey || e.altKey)) {
         if (e.shiftKey) {
           cell.tier = clampTier((cell.tier || 1) + 1);
@@ -1004,25 +1155,62 @@ function render() {
         return;
       }
 
+      // Manual room placement
       if (selectedRoom) {
+        // In hand mode, placing a room should consume that room card (or Uramot wildcard)
+        if (useHandMode) {
+          const counts = handCounts();
+          if ((counts[selectedRoom] || 0) > 0) {
+            consumeCard(selectedRoom);
+          } else if (medallions.Uramot > 0) {
+            medallions.Uramot -= 1;
+          } else {
+            uiMessage = `Can't place ${ROOM_NAMES[selectedRoom]}: not in hand (and no Uramot wildcard).`;
+            render();
+            return;
+          }
+        }
+
         cell.room = selectedRoom;
         cell.faded = planningMode;
         cell.tier = 1;
         cell.locked = false;
         cell.quipalUsed = false;
         suggestedMove = null;
-      } else if (selectedFloor) {
+        render();
+        return;
+      }
+
+      // Manual floor placement
+      if (selectedFloor) {
+        const cardKey = `FLOOR:${selectedFloor}`;
+
+        if (useHandMode) {
+          const counts = handCounts();
+          if ((counts[cardKey] || 0) > 0) {
+            consumeCard(cardKey);
+          } else if (medallions.Uramot > 0) {
+            medallions.Uramot -= 1;
+          } else {
+            uiMessage = `Can't place path tile ${selectedFloor}: not in hand (and no Uramot wildcard).`;
+            render();
+            return;
+          }
+        }
+
         cell.floor = selectedFloor;
         suggestedMove = null;
-      } else {
-        cell.faded = !cell.faded;
+        render();
+        return;
       }
+
+      // Toggle faded (planning)
+      cell.faded = !cell.faded;
       render();
     };
 
     btn.oncontextmenu = e => {
       e.preventDefault();
-
       if (cell.locked && !e.shiftKey) {
         uiMessage = "That room is LOCKED. Shift+Right-click to clear anyway.";
         render();
@@ -1045,7 +1233,7 @@ function render() {
   gridWrap.appendChild(gridEl);
   gridCol.appendChild(gridWrap);
 
-  /* ---------- FLOOR PALETTE (directly under the grid) ---------- */
+  /* ---------- FLOOR PALETTE (below grid) ---------- */
   const floorWrap = document.createElement("div");
   floorWrap.className = "mt-2 text-center";
 
@@ -1161,16 +1349,16 @@ function render() {
       Loop: ${hasLoop ? "<span class='text-red-400 font-semibold'>DETECTED</span>" : "<span class='text-emerald-300'>none</span>"}
     </div>
     <div class="mt-1">${uiMessage ? uiMessage : ""}</div>
-    <div class="mt-1">Tier edit: Shift/Alt or hover +/- buttons. (Red outline = not connected.)</div>
+    <div class="mt-1">Tier: Shift/Alt, or hover +/- buttons. (Red outline = not connected.)</div>
   `;
 
-  /* ---------- Medallions panel ---------- */
+  /* ---------- Medallions + Hand panel ---------- */
   const medBox = document.createElement("div");
   medBox.className = "mt-3 p-3 bg-zinc-800 rounded border border-zinc-700";
 
   const medTitle = document.createElement("div");
   medTitle.className = "font-semibold mb-2 text-amber-300";
-  medTitle.textContent = "Medallions (Loadout + Advice)";
+  medTitle.textContent = "Medallions + Hand";
 
   const medRow = document.createElement("div");
   medRow.className = "grid grid-cols-2 gap-2";
@@ -1200,7 +1388,7 @@ function render() {
     medInput("Jatalot", "Jatalot (Lock)"),
     medInput("Quipal", "Quipal (+1 Tier)"),
     medInput("Puaets", "Puaets (Reroll Hand)"),
-    medInput("Uramot", "Uramot (Place Missing)"),
+    medInput("Uramot", "Uramot (Wildcard)"),
     medInput("Zopex", "Zopex (Meta)"),
     medInput("Ascappers", "Ascappers (Meta)")
   );
@@ -1214,28 +1402,61 @@ function render() {
   ht.type = "checkbox";
   ht.checked = useHandMode;
   ht.onchange = (e) => { useHandMode = e.target.checked; render(); };
-  handToggle.append(ht, document.createTextNode("Hand (6 cards) mode — solver only suggests what you can place (unless Uramot)."));
+  handToggle.append(ht, document.createTextNode("Hand (6 cards) mode (rooms + floor tiles)."));
   handRow.appendChild(handToggle);
+
+  const consumeFloorsToggle = document.createElement("label");
+  consumeFloorsToggle.className = "text-xs flex items-center gap-2 mt-2";
+  consumeFloorsToggle.style.display = useHandMode ? "flex" : "none";
+  const cft = document.createElement("input");
+  cft.type = "checkbox";
+  cft.checked = consumeFloorsForAuto;
+  cft.onchange = (e) => { consumeFloorsForAuto = e.target.checked; render(); };
+  consumeFloorsToggle.append(cft, document.createTextNode("Consume floor tiles from hand when solver auto-paths (uses Uramot as wildcard if missing)."));
+  handRow.appendChild(consumeFloorsToggle);
 
   const handGrid = document.createElement("div");
   handGrid.className = "grid grid-cols-3 gap-2 mt-2";
   handGrid.style.display = useHandMode ? "grid" : "none";
 
-  const roomKeys = [null, ...Object.keys(ROOM_NAMES)];
-  function roomSelect(slot) {
+  const roomKeys = Object.keys(ROOM_NAMES);
+  const floorKeys = FLOOR_TILES.map(f => `FLOOR:${f}`);
+
+  function cardSelect(slot) {
     const sel = document.createElement("select");
     sel.className = "w-full bg-zinc-900 border border-zinc-700 rounded px-2 py-2 text-xs";
+
+    const optEmpty = document.createElement("option");
+    optEmpty.value = "";
+    optEmpty.textContent = "(empty)";
+    sel.appendChild(optEmpty);
+
+    const groupRooms = document.createElement("optgroup");
+    groupRooms.label = "Rooms";
     for (const k of roomKeys) {
       const opt = document.createElement("option");
-      opt.value = k ?? "";
-      opt.textContent = k ? ROOM_NAMES[k] : "(empty)";
-      sel.appendChild(opt);
+      opt.value = k;
+      opt.textContent = ROOM_NAMES[k] || k;
+      groupRooms.appendChild(opt);
     }
+    sel.appendChild(groupRooms);
+
+    const groupFloors = document.createElement("optgroup");
+    groupFloors.label = "Path Tiles (Floors)";
+    for (const k of floorKeys) {
+      const opt = document.createElement("option");
+      opt.value = k;
+      opt.textContent = `Path Tile: ${k.slice(6)}`;
+      groupFloors.appendChild(opt);
+    }
+    sel.appendChild(groupFloors);
+
     sel.value = hand[slot] ?? "";
     sel.onchange = (e) => { hand[slot] = e.target.value || null; render(); };
     return sel;
   }
-  for (let i = 0; i < 6; i++) handGrid.appendChild(roomSelect(i));
+
+  for (let i = 0; i < 6; i++) handGrid.appendChild(cardSelect(i));
 
   const handBtns = document.createElement("div");
   handBtns.className = "flex gap-2 mt-2";
@@ -1296,6 +1517,7 @@ function render() {
   const tutState = document.createElement("div");
   tutState.className = "text-xs opacity-70";
   tutState.textContent = tutorialOpen ? "Hide" : "Show";
+
   tutHeader.append(tutTitle, tutState);
 
   const tutBody = document.createElement("div");
@@ -1303,16 +1525,25 @@ function render() {
   tutBody.className = "mt-2 text-xs leading-relaxed";
   tutBody.innerHTML = `
     <div class="mini">
-      <div class="font-semibold text-zinc-100 mb-1">Crash fix</div>
-      <div>Quipal advice is now safe when there are 0 upgrade candidates, and capped to 10 suggestions to avoid UI freezes.</div>
-
+      <div class="font-semibold text-zinc-100 mb-1">Fixes in this build</div>
+      <ul class="list-disc ml-5">
+        <li><b>Quipal crash fixed</b>: no more undefined candidates; capped Quipal suggestions to 10.</li>
+        <li><b>+ / – no longer disappear</b>: controls are inside the cell + use opacity instead of display + fixed transform override.</li>
+        <li><b>Hand supports floors</b>: you can now put path tiles in your hand and consume them on placement (and optionally for solver auto-pathing).</li>
+      </ul>
+      <div class="font-semibold text-zinc-100 mt-3 mb-1">Hand mode notes</div>
+      <ul class="list-disc ml-5">
+        <li>Manual placing a room/floor consumes the matching card from hand, or uses <b>Uramot wildcard</b> if missing.</li>
+        <li>If you enable <b>Consume floor tiles for auto-pathing</b>, solver actions will also spend floor cards (or Uramot).</li>
+      </ul>
       <div class="font-semibold text-zinc-100 mt-3 mb-1">Tier controls</div>
       <ul class="list-disc ml-5">
         <li><b>Shift+Click</b> tier up, <b>Alt+Click</b> tier down.</li>
-        <li>Hover a room tile to use the <b>+ / –</b> buttons (stops click propagation).</li>
+        <li>Hover any room tile for the <b>+ / –</b> buttons.</li>
       </ul>
     </div>
   `;
+
   tutBox.append(tutHeader, tutBody);
 
   controls.append(row1, row2, status, medBox, tutBox);
@@ -1373,7 +1604,7 @@ function render() {
       if (rule.targets.includes(room)) mult += rule.amount * n;
     });
 
-    if (mult > 1) boostReport.push(`${ROOM_NAMES[room]}: +${Math.round((mult - 1) * 100)}% (included on % effects)`);
+    if (mult > 1) boostReport.push(`${ROOM_NAMES[room] || room}: +${Math.round((mult - 1) * 100)}% (included on % effects)`);
 
     formatBonuses(room, obj.percent * mult, obj.flat).forEach(text => {
       const cat = categoryOf(text);
