@@ -1,0 +1,1090 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Temple Tile Simulator</title>
+<script src="https://cdn.tailwindcss.com"></script>
+
+<style>
+  .cell {
+    position: relative;
+    width: 3rem;
+    height: 3rem;
+    background: #27272a;
+    border-radius: 0.5rem;
+  }
+
+  .floor {
+    position: absolute;
+    inset: 0;
+    border: 3px solid #98854d;
+    border-radius: 0.5rem;
+    background: #372f21;
+    z-index: 1;
+  }
+
+  .open-U { border-top-color: transparent; }
+  .open-R { border-right-color: transparent; }
+  .open-D { border-bottom-color: transparent; }
+  .open-L { border-left-color: transparent; }
+
+  .room {
+    position: absolute;
+    inset: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 2;
+    pointer-events: none;
+  }
+
+  .room img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+
+  .faded {
+    opacity: 0.6;
+    filter: saturate(0.7);
+  }
+
+  .badge {
+    position: absolute;
+    top: -7px;
+    left: -7px;
+    z-index: 3;
+    font-size: 10px;
+    line-height: 1;
+    padding: 3px 6px;
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.25);
+    background: rgba(0,0,0,0.55);
+    color: rgba(255,255,255,0.85);
+    pointer-events: none;
+  }
+
+  /* =========================
+     Diamond / 45° grid view
+     ========================= */
+  #grid-rot-wrap {
+    /* Prevents clipping when the grid rotates (diamond gets bigger) */
+    padding: 80px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+  }
+
+  #temple-grid {
+    transform: rotate(45deg);
+    transform-origin: center;
+  }
+
+  /* Keep room icons upright, while the grid and corridors rotate */
+  #temple-grid .room {
+    transform: rotate(-45deg);
+    transform-origin: center;
+  }
+
+  /* Keep badges upright too */
+  #temple-grid .badge {
+    transform: rotate(-45deg);
+    transform-origin: center;
+  }
+</style>
+</head>
+
+<body class="bg-zinc-900 text-zinc-100">
+<div id="app" class="p-6"></div>
+
+<script>
+const GRID_SIZE = 9;
+let selectedRoom = null;
+let selectedFloor = null;
+let planningMode = false;
+
+/* ===============================
+   "Entrance" / connectivity root
+   =============================== */
+const ENTRANCE = { r: GRID_SIZE - 1, c: Math.floor(GRID_SIZE / 2) }; // (8,4)
+const entranceIndex = () => ENTRANCE.r * GRID_SIZE + ENTRANCE.c;
+
+let uiMessage = "";
+let suggestedMove = null; // { kind, index, step, roomKey }
+
+/* ----------------------------
+   Grid model
+   ---------------------------- */
+let grid = Array(GRID_SIZE * GRID_SIZE).fill(null).map(() => ({
+  room: null,
+  floor: null,
+  faded: false
+}));
+
+const FLOOR_TILES = [
+  "U","R","D","L",
+  "UR","RD","DL","LU","UD","LR",
+  "URD","RDL","DLU","LUR",
+  "URDL"
+];
+
+const FLOOR_KEY_TO_TILE = (() => {
+  const map = {};
+  for (const t of FLOOR_TILES) {
+    const key = [...t].sort().join("");
+    map[key] = t;
+  }
+  return map;
+})();
+
+const ROOM_NAMES = {
+  Spymaster:"Spymaster",
+  Garrison:"Garrison",
+  LegionBarrack:"Legion Barracks",
+  Commander:"Commander",
+  FleshSurgeon:"Flesh Surgeon",
+  Smithy:"Smithy",
+  Armoury:"Armoury",
+  SynthfleshLab:"Synthflesh Lab",
+  TranscendentBarracks:"Transcendent Barracks",
+  GolemWorks:"Golem Works",
+  AlchemyLab:"Alchemy Lab",
+  Thaumaturge:"Thaumaturge",
+  CorruptionChamber:"Corruption Chamber",
+  Generator:"Generator",
+  SacrificialChamber:"Sacrificial Chamber",
+  SealedVault:"Sealed Vault"
+};
+
+const ROOM_ICONS = {
+  AlchemyLab:"icons/IconAlchemyLab.webp",
+  Armoury:"icons/IconArmoury.webp",
+  Commander:"icons/IconCommander.webp",
+  CorruptionChamber:"icons/IconCorruption.webp",
+  FleshSurgeon:"icons/IconFleshSurgeon.webp",
+  Garrison:"icons/IconGarrison.webp",
+  Generator:"icons/IconGenerator.webp",
+  GolemWorks:"icons/IconGolemWorks.webp",
+  SacrificialChamber:"icons/IconSacrificialChamber.webp",
+  Smithy:"icons/IconSmithy.webp",
+  SynthfleshLab:"icons/IconSynthflesh.webp",
+  Thaumaturge:"icons/IconThaumaturge.webp",
+  TranscendentBarracks:"icons/IconTranscendentBarracks.webp",
+  SealedVault:"icons/IconVault.webp",
+  LegionBarrack:"icons/IconViperLegionBarracks.webp",
+  Spymaster:"icons/IconViperSpymaster.webp"
+};
+
+const ROOM_TILES = {
+  Spymaster: { bonuses: ["MEDALLION:HIGH:LOCK"] },
+  Garrison: { bonuses: ["20% Monster Packs", "30% Normal Monster Effectiveness"] },
+  LegionBarrack: { bonuses: ["60% More Rare Monsters", "MEDALLION:HIGH:ADVANCED"] },
+  Commander: { bonuses: ["60% Rare Monster Effectiveness", "MEDALLION:LOW:ADVANCED"] },
+  FleshSurgeon: { bonuses: ["40% Unique Monster Effectiveness", "ITEM:Limb Modification"] },
+  Smithy: { bonuses: ["60% Chest Item Rarity", "ITEM:Vaal Infuser"] },
+  Armoury: { bonuses: ["60% Humanoid Monster Effectiveness"] },
+  SynthfleshLab: { bonuses: ["40% Experience"] },
+  TranscendentBarracks: { bonuses: ["60% More Magic Monsters"] },
+  GolemWorks: { bonuses: ["ADD:High Priest", "MEDALLION:HIGH:ROOM"] },
+  AlchemyLab: { bonuses: ["60% Item Rarity", "50% Gold", "ITEM:Core Destabiliser", "MEDALLION:LOW:ROOM"] },
+  Thaumaturge: { bonuses: ["ADD:Quadrilla Sergeant", "ITEM:Crystallised Corruption", "MEDALLION:HIGH:ADVANCED"] },
+  CorruptionChamber: { bonuses: ["60% Chance Rare Monster +1 Mod", "ADD:Royal Sentinel", "ITEM:Architect's Orb"] },
+  Generator: { bonuses: ["60% Construct Monster Effectiveness", "ADD:Corrupted Abomination"] },
+  SacrificialChamber: { bonuses: ["60% Increased Rare Chest", "ADD:Unchained Beast", "ITEM:Vaal Cultivation Orb", "MEDALLION:HIGH:ADVANCED"] },
+  SealedVault: { bonuses: ["25% Item Rarity"] }
+};
+
+/* ---------- BOOST RULES ---------- */
+const BOOST_RULES = {
+  Spymaster: {
+    amount: 0.30,
+    targets: ["Garrison", "Commander", "Armoury", "Smithy", "LegionBarrack"]
+  },
+  Thaumaturge: {
+    amount: 0.30,
+    targets: ["CorruptionChamber", "SealedVault", "SacrificialChamber"]
+  }
+};
+
+function formatBonuses(tileKey, count = 1) {
+  return ROOM_TILES[tileKey]?.bonuses.map(b => {
+    if (b.startsWith("MEDALLION:")) {
+      const [, chance, type] = b.split(":");
+      return `+${count} ${chance === "HIGH" ? "High" : "Low"} Chance ${type} Medallion`;
+    }
+    if (b.startsWith("ITEM:")) return `+${count} ${b.slice(5)}`;
+    if (b.startsWith("ADD:")) return `Adds ${count} ${b.slice(4)} to map`;
+    const m = b.match(/(\d+)%\s*(.*)/);
+    if (m) return `${Math.round(parseInt(m[1]) * count)}% ${m[2]}`;
+    return b;
+  }) ?? [];
+}
+
+function categoryOf(text) {
+  if (text.includes("Medallion")) return "Medallions";
+  if (text.startsWith("+")) return "Items";
+  if (text.startsWith("Adds")) return "Map Adds";
+  if (text.includes("Monster")) return "Monster";
+  return "Other";
+}
+
+/* ===============================
+   Floor graph helpers
+   =============================== */
+const DIRS = {
+  U: { dr: -1, dc: 0, opp: "D" },
+  R: { dr: 0, dc: 1, opp: "L" },
+  D: { dr: 1, dc: 0, opp: "U" },
+  L: { dr: 0, dc: -1, opp: "R" }
+};
+
+function inBounds(r,c) { return r >= 0 && c >= 0 && r < GRID_SIZE && c < GRID_SIZE; }
+function idx(r,c) { return r * GRID_SIZE + c; }
+function rc(i) { return { r: Math.floor(i / GRID_SIZE), c: i % GRID_SIZE }; }
+function opens(floorStr, dir) { return !!floorStr && floorStr.includes(dir); }
+
+function neighborsOfIndex(i) {
+  const { r, c } = rc(i);
+  const out = [];
+  for (const d of ["U","R","D","L"]) {
+    const nr = r + DIRS[d].dr;
+    const nc = c + DIRS[d].dc;
+    if (!inBounds(nr,nc)) continue;
+    out.push({ dir: d, index: idx(nr,nc) });
+  }
+  return out;
+}
+
+function floorEdgeExists(a, b) {
+  const A = grid[a]?.floor;
+  const B = grid[b]?.floor;
+  if (!A || !B) return false;
+
+  const ar = rc(a), br = rc(b);
+  const dr = br.r - ar.r;
+  const dc = br.c - ar.c;
+
+  let dir = null;
+  if (dr === -1 && dc === 0) dir = "U";
+  else if (dr === 1 && dc === 0) dir = "D";
+  else if (dr === 0 && dc === 1) dir = "R";
+  else if (dr === 0 && dc === -1) dir = "L";
+  else return false;
+
+  const opp = DIRS[dir].opp;
+  return opens(A, dir) && opens(B, opp);
+}
+
+function graphNeighbors(i) {
+  const out = [];
+  for (const n of neighborsOfIndex(i)) {
+    if (floorEdgeExists(i, n.index)) out.push(n.index);
+  }
+  return out;
+}
+
+function connectedFromEntrance() {
+  const start = entranceIndex();
+  const visited = new Set([start]);
+  const q = [start];
+  while (q.length) {
+    const cur = q.shift();
+    for (const nxt of graphNeighbors(cur)) {
+      if (visited.has(nxt)) continue;
+      visited.add(nxt);
+      q.push(nxt);
+    }
+  }
+  return visited;
+}
+
+// Detect cycle in the connected component containing Entrance
+function entranceHasLoop() {
+  const start = entranceIndex();
+  const visited = new Set();
+  const parent = new Map();
+  const stack = [start];
+  parent.set(start, null);
+
+  while (stack.length) {
+    const node = stack.pop();
+    if (!visited.has(node)) visited.add(node);
+
+    for (const nxt of graphNeighbors(node)) {
+      if (!visited.has(nxt)) {
+        parent.set(nxt, node);
+        stack.push(nxt);
+      } else {
+        const p = parent.get(node);
+        if (p !== nxt) return true; // undirected cycle
+      }
+    }
+  }
+  return false;
+}
+
+function dirsToTileString(dirSet) {
+  const key = [...dirSet].sort().join("");
+  return FLOOR_KEY_TO_TILE[key] ?? null;
+}
+
+function addOpen(i, dir) {
+  const cur = grid[i].floor;
+  const set = new Set(cur ? [...cur] : []);
+  set.add(dir);
+  grid[i].floor = dirsToTileString(set);
+}
+
+function connectCells(a, b) {
+  const ar = rc(a), br = rc(b);
+  const dr = br.r - ar.r;
+  const dc = br.c - ar.c;
+
+  let dir = null;
+  if (dr === -1 && dc === 0) dir = "U";
+  else if (dr === 1 && dc === 0) dir = "D";
+  else if (dr === 0 && dc === 1) dir = "R";
+  else if (dr === 0 && dc === -1) dir = "L";
+  if (!dir) return;
+
+  addOpen(a, dir);
+  addOpen(b, DIRS[dir].opp);
+}
+
+/* ===============================
+   Spymaster conversion (Barracks -> Legion Barracks)
+   =============================== */
+function isActiveRoom(i, key) {
+  return grid[i].room === key && !grid[i].faded;
+}
+
+function hasActiveAdjacent(i, key) {
+  for (const n of neighborsOfIndex(i)) {
+    if (isActiveRoom(n.index, key)) return true;
+  }
+  return false;
+}
+
+// If TranscendentBarracks is adjacent to an active Spymaster, treat as LegionBarrack
+function getEffectiveRoomKey(i) {
+  const cell = grid[i];
+  if (!cell.room || cell.faded) return cell.room;
+
+  if (cell.room === "TranscendentBarracks" && hasActiveAdjacent(i, "Spymaster")) {
+    return "LegionBarrack";
+  }
+  return cell.room;
+}
+
+/* ===============================
+   Auto-solvers
+   =============================== */
+
+/* --- Spymaster Snake (left side) --- */
+const SNAKE_PATTERN = ["Armoury", "TranscendentBarracks", "Spymaster", "TranscendentBarracks"];
+let cachedSnake = null;
+
+function getSnakePath() {
+  if (cachedSnake) return cachedSnake;
+
+  // columns 3..0 in a vertical serpentine
+  const cols = [3,2,1,0];
+  const path = [];
+  let up = true;
+
+  for (const col of cols) {
+    if (up) for (let r = GRID_SIZE - 1; r >= 0; r--) path.push(idx(r, col));
+    else for (let r = 0; r < GRID_SIZE; r++) path.push(idx(r, col));
+    up = !up;
+  }
+
+  cachedSnake = path.filter(i => i !== entranceIndex());
+  return cachedSnake;
+}
+
+function expectedSnakeRoom(step) {
+  return SNAKE_PATTERN[step % SNAKE_PATTERN.length];
+}
+
+function snakeFirstEmptyStep() {
+  const path = getSnakePath();
+  for (let step = 0; step < path.length; step++) {
+    const i = path[step];
+    if (!grid[i].room) return step;
+  }
+  return null;
+}
+
+function ensureSnakeFloors(uptoStepInclusive) {
+  const path = getSnakePath();
+  if (uptoStepInclusive === null || uptoStepInclusive < 0) return;
+
+  // Entrance -> first snake tile
+  connectCells(entranceIndex(), path[0]);
+
+  for (let step = 0; step < uptoStepInclusive; step++) {
+    connectCells(path[step], path[step + 1]);
+  }
+}
+
+function validateSnakePrefix() {
+  const path = getSnakePath();
+  const mismatches = [];
+  for (let step = 0; step < path.length; step++) {
+    const i = path[step];
+    const room = grid[i].room;
+    if (!room) break;
+    const exp = expectedSnakeRoom(step);
+    if (room !== exp) mismatches.push({ step, index: i, expected: exp, found: room });
+  }
+  return mismatches;
+}
+
+function suggestSnakeNext() {
+  const path = getSnakePath();
+  const mismatches = validateSnakePrefix();
+
+  const step = snakeFirstEmptyStep();
+  if (step === null) return { ok: false, reason: "Snake path is full." };
+
+  const i = path[step];
+  const roomKey = expectedSnakeRoom(step);
+
+  return { ok: true, move: { kind: "snake", index: i, step, roomKey }, warn: mismatches.length ? mismatches : null };
+}
+
+/* --- Corruption package (right side branch) --- */
+const CORRUPT_PATTERN = ["Generator", "SacrificialChamber", "Thaumaturge", "CorruptionChamber", "AlchemyLab", "SealedVault"];
+let cachedCorrupt = null;
+
+function getCorruptionPath() {
+  if (cachedCorrupt) return cachedCorrupt;
+
+  // A simple vertical branch starting at (8,5) going upward.
+  // This stays on the "right side" and is always loop-free if only connected at Entrance.
+  const coords = [
+    { r: GRID_SIZE - 1, c: 5 }, // (8,5)
+    { r: GRID_SIZE - 2, c: 5 }, // (7,5)
+    { r: GRID_SIZE - 3, c: 5 }, // (6,5)
+    { r: GRID_SIZE - 4, c: 5 }, // (5,5)
+    { r: GRID_SIZE - 5, c: 5 }, // (4,5)
+    { r: GRID_SIZE - 6, c: 5 }, // (3,5)
+  ];
+
+  cachedCorrupt = coords
+    .filter(p => inBounds(p.r, p.c))
+    .map(p => idx(p.r, p.c))
+    .filter(i => i !== entranceIndex());
+
+  return cachedCorrupt;
+}
+
+function expectedCorruptRoom(step) {
+  return CORRUPT_PATTERN[step % CORRUPT_PATTERN.length];
+}
+
+function corruptFirstEmptyStep() {
+  const path = getCorruptionPath();
+  for (let step = 0; step < path.length; step++) {
+    const i = path[step];
+    if (!grid[i].room) return step;
+  }
+  return null;
+}
+
+function ensureCorruptionFloors(uptoStepInclusive) {
+  const path = getCorruptionPath();
+  if (uptoStepInclusive === null || uptoStepInclusive < 0) return;
+
+  // Entrance -> first corruption tile (branch)
+  connectCells(entranceIndex(), path[0]);
+
+  for (let step = 0; step < uptoStepInclusive; step++) {
+    connectCells(path[step], path[step + 1]);
+  }
+}
+
+function validateCorruptionPrefix() {
+  const path = getCorruptionPath();
+  const mismatches = [];
+  for (let step = 0; step < path.length; step++) {
+    const i = path[step];
+    const room = grid[i].room;
+    if (!room) break;
+    const exp = expectedCorruptRoom(step);
+    if (room !== exp) mismatches.push({ step, index: i, expected: exp, found: room });
+  }
+  return mismatches;
+}
+
+function suggestCorruptionNext() {
+  const path = getCorruptionPath();
+  const mismatches = validateCorruptionPrefix();
+
+  const step = corruptFirstEmptyStep();
+  if (step === null) return { ok: false, reason: "Corruption path is full." };
+
+  const i = path[step];
+  const roomKey = expectedCorruptRoom(step);
+
+  return { ok: true, move: { kind: "corrupt", index: i, step, roomKey }, warn: mismatches.length ? mismatches : null };
+}
+
+/* --- Shared solver actions --- */
+function clearAllRoomsAndFloors() {
+  grid.forEach(c => {
+    c.room = null;
+    c.floor = null;
+    c.faded = false;
+  });
+  suggestedMove = null;
+}
+
+function applySuggestion(s) {
+  if (!s.ok) {
+    uiMessage = s.reason;
+    suggestedMove = null;
+    return;
+  }
+
+  suggestedMove = s.move;
+  const { kind, index, step, roomKey } = s.move;
+
+  if (grid[index].room && grid[index].room !== roomKey) {
+    uiMessage = `Target cell already has ${ROOM_NAMES[grid[index].room]} (expected ${ROOM_NAMES[roomKey]}). Clear it or rebuild.`;
+    return;
+  }
+
+  grid[index].room = roomKey;
+  grid[index].faded = planningMode;
+
+  if (kind === "snake") ensureSnakeFloors(step);
+  if (kind === "corrupt") ensureCorruptionFloors(step);
+
+  const warn = s.warn || [];
+  if (warn.length) {
+    const first = warn[0];
+    uiMessage = `Placed ${kind} step ${step + 1}, but mismatch earlier at step ${first.step + 1} (expected ${ROOM_NAMES[first.expected]}, found ${ROOM_NAMES[first.found]}).`;
+  } else {
+    uiMessage = `Placed ${kind} step ${step + 1}: ${ROOM_NAMES[roomKey]} at (${rc(index).r},${rc(index).c}).`;
+  }
+}
+
+function setSuggestionOnly(s) {
+  if (!s.ok) {
+    uiMessage = s.reason;
+    suggestedMove = null;
+    return;
+  }
+  suggestedMove = s.move;
+
+  const warn = s.warn || [];
+  if (warn.length) {
+    const first = warn[0];
+    uiMessage = `Suggested ${s.move.kind} step ${s.move.step + 1}: ${ROOM_NAMES[s.move.roomKey]}. Warning: mismatch at step ${first.step + 1} (expected ${ROOM_NAMES[first.expected]}, found ${ROOM_NAMES[first.found]}).`;
+  } else {
+    uiMessage = `Suggested ${s.move.kind} step ${s.move.step + 1}: ${ROOM_NAMES[s.move.roomKey]} at (${rc(s.move.index).r},${rc(s.move.index).c}).`;
+  }
+}
+
+function autoBuildSnake(nSteps) {
+  // Does NOT clear. It fills from first empty.
+  const path = getSnakePath();
+  const start = snakeFirstEmptyStep();
+  if (start === null) { uiMessage = "Snake is already full."; return; }
+
+  const steps = Math.max(0, Math.min(nSteps, path.length - start));
+  let lastPlaced = null;
+
+  for (let s = 0; s < steps; s++) {
+    const step = start + s;
+    const i = path[step];
+    if (grid[i].room) continue;
+    grid[i].room = expectedSnakeRoom(step);
+    grid[i].faded = planningMode;
+    lastPlaced = step;
+  }
+
+  if (lastPlaced !== null) ensureSnakeFloors(lastPlaced);
+  uiMessage = `Auto-built Snake: ${steps} step(s) from first empty.`;
+  suggestedMove = null;
+}
+
+function autoBuildCorruption(nSteps) {
+  const path = getCorruptionPath();
+  const start = corruptFirstEmptyStep();
+  if (start === null) { uiMessage = "Corruption path is already full."; return; }
+
+  const steps = Math.max(0, Math.min(nSteps, path.length - start));
+  let lastPlaced = null;
+
+  for (let s = 0; s < steps; s++) {
+    const step = start + s;
+    const i = path[step];
+    if (grid[i].room) continue;
+    grid[i].room = expectedCorruptRoom(step);
+    grid[i].faded = planningMode;
+    lastPlaced = step;
+  }
+
+  if (lastPlaced !== null) ensureCorruptionFloors(lastPlaced);
+  uiMessage = `Auto-built Corruption package: ${steps} step(s) from first empty.`;
+  suggestedMove = null;
+}
+
+function autoBuildPlan(snakeSteps, corruptSteps) {
+  clearAllRoomsAndFloors();
+
+  // place snake
+  const sp = getSnakePath();
+  const sCount = Math.max(0, Math.min(snakeSteps, sp.length));
+  for (let step = 0; step < sCount; step++) {
+    const i = sp[step];
+    grid[i].room = expectedSnakeRoom(step);
+    grid[i].faded = planningMode;
+  }
+  if (sCount > 0) ensureSnakeFloors(sCount - 1);
+
+  // place corruption
+  const cp = getCorruptionPath();
+  const cCount = Math.max(0, Math.min(corruptSteps, cp.length));
+  for (let step = 0; step < cCount; step++) {
+    const i = cp[step];
+    grid[i].room = expectedCorruptRoom(step);
+    grid[i].faded = planningMode;
+  }
+  if (cCount > 0) ensureCorruptionFloors(cCount - 1);
+
+  uiMessage = `Auto-built plan: Snake ${sCount} steps + Corruption ${cCount} steps (loop-free, connected at Entrance).`;
+  suggestedMove = null;
+}
+
+function rebuildFloorsForAllPlaced() {
+  // Clear floors then rebuild snake+corruption floors for their current filled prefixes
+  grid.forEach(c => c.floor = null);
+
+  const sp = getSnakePath();
+  let sUpto = -1;
+  for (let step = 0; step < sp.length; step++) {
+    if (!grid[sp[step]].room) break;
+    sUpto = step;
+  }
+  if (sUpto >= 0) ensureSnakeFloors(sUpto);
+
+  const cp = getCorruptionPath();
+  let cUpto = -1;
+  for (let step = 0; step < cp.length; step++) {
+    if (!grid[cp[step]].room) break;
+    cUpto = step;
+  }
+  if (cUpto >= 0) ensureCorruptionFloors(cUpto);
+
+  uiMessage = "Rebuilt floors for currently filled Snake + Corruption prefixes.";
+  suggestedMove = null;
+}
+
+/* ---------- SAVE / LOAD ---------- */
+function saveLayout() {
+  navigator.clipboard.writeText(JSON.stringify(grid));
+  alert("Layout copied to clipboard");
+}
+
+function loadLayout() {
+  const input = prompt("Paste layout data:");
+  if (!input) return;
+  try {
+    const parsed = JSON.parse(input);
+    if (Array.isArray(parsed) && parsed.length === GRID_SIZE * GRID_SIZE) {
+      grid = parsed;
+      suggestedMove = null;
+      uiMessage = "Loaded layout.";
+      render();
+    }
+  } catch {}
+}
+
+/* ---------- RENDER ---------- */
+function render() {
+  const app = document.getElementById("app");
+  app.innerHTML = "";
+
+  const container = document.createElement("div");
+  container.className = "flex gap-6";
+
+  /* ---------- GRID ---------- */
+  const gridCol = document.createElement("div");
+
+  const gridWrap = document.createElement("div");
+  gridWrap.id = "grid-rot-wrap";
+
+  const gridEl = document.createElement("div");
+  gridEl.id = "temple-grid";
+  gridEl.className = "grid grid-cols-9 gap-2";
+
+  const connected = connectedFromEntrance();
+  const hasLoop = entranceHasLoop();
+
+  grid.forEach((cell, i) => {
+    const btn = document.createElement("button");
+    btn.className = "cell";
+
+    // Entrance highlight
+    if (i === entranceIndex()) btn.classList.add("ring-2","ring-sky-400");
+
+    // Suggested highlight
+    if (suggestedMove && i === suggestedMove.index) btn.classList.add("ring-2","ring-amber-400");
+
+    // Disconnected room highlight
+    if (cell.room && !connected.has(i)) btn.classList.add("ring-2","ring-red-500");
+
+    // Floor
+    if (cell.floor) {
+      const f = document.createElement("div");
+      f.className = "floor " + [...cell.floor].map(d => "open-" + d).join(" ");
+      btn.appendChild(f);
+    }
+
+    // Room (effective icon if converted)
+    if (cell.room) {
+      const eff = getEffectiveRoomKey(i) || cell.room;
+
+      const r = document.createElement("div");
+      r.className = "room";
+      const img = document.createElement("img");
+      img.src = ROOM_ICONS[eff] || ROOM_ICONS[cell.room];
+      r.appendChild(img);
+      btn.appendChild(r);
+
+      if (!cell.faded && cell.room === "TranscendentBarracks" && eff === "LegionBarrack") {
+        const b = document.createElement("div");
+        b.className = "badge";
+        b.textContent = "LEGION";
+        btn.appendChild(b);
+      }
+    }
+
+    if (cell.faded) btn.classList.add("faded");
+
+    // Tooltip
+    const eff = getEffectiveRoomKey(i);
+    const connText = cell.room ? (connected.has(i) ? "connected" : "DISCONNECTED") : "empty";
+    const floorText = cell.floor ? cell.floor : "(no floor)";
+    const roomText = cell.room ? ROOM_NAMES[cell.room] : "(no room)";
+    const effText = (cell.room && eff && eff !== cell.room) ? ` (effective: ${ROOM_NAMES[eff]})` : "";
+    btn.title = `${roomText}${effText}\nFloor: ${floorText}\nStatus: ${connText}\nPos: (${rc(i).r},${rc(i).c})`;
+
+    btn.onclick = () => {
+      if (selectedRoom) {
+        cell.room = selectedRoom;
+        cell.faded = planningMode;
+        suggestedMove = null;
+      } else if (selectedFloor) {
+        cell.floor = selectedFloor;
+        suggestedMove = null;
+      } else {
+        cell.faded = !cell.faded;
+      }
+      render();
+    };
+
+    btn.oncontextmenu = e => {
+      e.preventDefault();
+      cell.room = null;
+      cell.floor = null;
+      suggestedMove = null;
+      render();
+    };
+
+    gridEl.appendChild(btn);
+  });
+
+  gridWrap.appendChild(gridEl);
+  gridCol.appendChild(gridWrap);
+
+  /* ---------- CONTROLS ---------- */
+  const controls = document.createElement("div");
+  controls.className = "flex flex-col gap-2 mt-3";
+
+  const row1 = document.createElement("div");
+  row1.className = "flex gap-2 flex-wrap";
+
+  const saveBtn = document.createElement("button");
+  saveBtn.textContent = "Save";
+  saveBtn.className = "px-3 py-1 bg-zinc-700 rounded";
+  saveBtn.onclick = saveLayout;
+
+  const loadBtn = document.createElement("button");
+  loadBtn.textContent = "Load";
+  loadBtn.className = "px-3 py-1 bg-zinc-700 rounded";
+  loadBtn.onclick = loadLayout;
+
+  const planning = document.createElement("label");
+  planning.className = "flex items-center gap-2 text-sm px-2";
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.checked = planningMode;
+  cb.onchange = e => { planningMode = e.target.checked; render(); };
+  planning.append(cb, document.createTextNode("Planning mode"));
+
+  const resetBtn = document.createElement("button");
+  resetBtn.textContent = "Clear all";
+  resetBtn.className = "px-3 py-1 bg-zinc-700 rounded";
+  resetBtn.onclick = () => { clearAllRoomsAndFloors(); uiMessage = "Cleared all rooms and floors."; render(); };
+
+  row1.append(saveBtn, loadBtn, planning, resetBtn);
+
+  /* ---- Solver controls ---- */
+  const row2 = document.createElement("div");
+  row2.className = "flex gap-2 flex-wrap items-center";
+
+  // Snake block
+  const snakeLabel = document.createElement("div");
+  snakeLabel.className = "text-sm font-semibold text-emerald-300";
+  snakeLabel.textContent = "Spymaster Snake:";
+
+  const snakeSuggestBtn = document.createElement("button");
+  snakeSuggestBtn.textContent = "Suggest";
+  snakeSuggestBtn.className = "px-3 py-1 bg-emerald-700 rounded";
+  snakeSuggestBtn.onclick = () => { setSuggestionOnly(suggestSnakeNext()); render(); };
+
+  const snakeStepBtn = document.createElement("button");
+  snakeStepBtn.textContent = "Auto place 1";
+  snakeStepBtn.className = "px-3 py-1 bg-emerald-700 rounded";
+  snakeStepBtn.onclick = () => { applySuggestion(suggestSnakeNext()); render(); };
+
+  const snakeN = document.createElement("input");
+  snakeN.type = "number";
+  snakeN.min = "0";
+  snakeN.max = String(getSnakePath().length);
+  snakeN.value = "12";
+  snakeN.className = "w-20 px-2 py-1 bg-zinc-800 rounded border border-zinc-700 text-sm";
+  snakeN.title = "How many Snake steps to add from first empty";
+
+  const snakeBuildBtn = document.createElement("button");
+  snakeBuildBtn.textContent = "Auto build N";
+  snakeBuildBtn.className = "px-3 py-1 bg-emerald-700 rounded";
+  snakeBuildBtn.onclick = () => { autoBuildSnake(parseInt(snakeN.value || "0", 10)); render(); };
+
+  // Corruption block
+  const corruptLabel = document.createElement("div");
+  corruptLabel.className = "text-sm font-semibold text-sky-300 ml-2";
+  corruptLabel.textContent = "Corruption package:";
+
+  const corruptSuggestBtn = document.createElement("button");
+  corruptSuggestBtn.textContent = "Suggest";
+  corruptSuggestBtn.className = "px-3 py-1 bg-sky-700 rounded";
+  corruptSuggestBtn.onclick = () => { setSuggestionOnly(suggestCorruptionNext()); render(); };
+
+  const corruptStepBtn = document.createElement("button");
+  corruptStepBtn.textContent = "Auto place 1";
+  corruptStepBtn.className = "px-3 py-1 bg-sky-700 rounded";
+  corruptStepBtn.onclick = () => { applySuggestion(suggestCorruptionNext()); render(); };
+
+  const corruptN = document.createElement("input");
+  corruptN.type = "number";
+  corruptN.min = "0";
+  corruptN.max = String(getCorruptionPath().length);
+  corruptN.value = String(getCorruptionPath().length);
+  corruptN.className = "w-20 px-2 py-1 bg-zinc-800 rounded border border-zinc-700 text-sm";
+  corruptN.title = "How many Corruption steps to add from first empty";
+
+  const corruptBuildBtn = document.createElement("button");
+  corruptBuildBtn.textContent = "Auto build N";
+  corruptBuildBtn.className = "px-3 py-1 bg-sky-700 rounded";
+  corruptBuildBtn.onclick = () => { autoBuildCorruption(parseInt(corruptN.value || "0", 10)); render(); };
+
+  // Combined
+  const planLabel = document.createElement("div");
+  planLabel.className = "text-sm font-semibold text-amber-300 ml-2";
+  planLabel.textContent = "Full plan:";
+
+  const planSnake = document.createElement("input");
+  planSnake.type = "number";
+  planSnake.min = "0";
+  planSnake.max = String(getSnakePath().length);
+  planSnake.value = "24";
+  planSnake.className = "w-20 px-2 py-1 bg-zinc-800 rounded border border-zinc-700 text-sm";
+  planSnake.title = "Snake steps (clears first)";
+
+  const planCorrupt = document.createElement("input");
+  planCorrupt.type = "number";
+  planCorrupt.min = "0";
+  planCorrupt.max = String(getCorruptionPath().length);
+  planCorrupt.value = String(getCorruptionPath().length);
+  planCorrupt.className = "w-20 px-2 py-1 bg-zinc-800 rounded border border-zinc-700 text-sm";
+  planCorrupt.title = "Corruption steps (clears first)";
+
+  const planBtn = document.createElement("button");
+  planBtn.textContent = "Auto build (clear)";
+  planBtn.className = "px-3 py-1 bg-amber-700 rounded";
+  planBtn.onclick = () => {
+    autoBuildPlan(parseInt(planSnake.value || "0", 10), parseInt(planCorrupt.value || "0", 10));
+    render();
+  };
+
+  const rebuildFloorsBtn = document.createElement("button");
+  rebuildFloorsBtn.textContent = "Rebuild floors";
+  rebuildFloorsBtn.className = "px-3 py-1 bg-zinc-700 rounded";
+  rebuildFloorsBtn.onclick = () => { rebuildFloorsForAllPlaced(); render(); };
+
+  row2.append(
+    snakeLabel, snakeSuggestBtn, snakeStepBtn, snakeN, snakeBuildBtn,
+    corruptLabel, corruptSuggestBtn, corruptStepBtn, corruptN, corruptBuildBtn,
+    planLabel, planSnake, planCorrupt, planBtn,
+    rebuildFloorsBtn
+  );
+
+  const status = document.createElement("div");
+  status.className = "text-xs mt-1 opacity-80";
+
+  const nActiveRooms = grid.filter(c => c.room && !c.faded).length;
+  const nConnectedActiveRooms = grid
+    .map((c,i) => ({ c, i }))
+    .filter(x => x.c.room && !x.c.faded && connected.has(x.i)).length;
+
+  status.innerHTML = `
+    <div>
+      Entrance: (${ENTRANCE.r},${ENTRANCE.c}) |
+      Active rooms: <span class="text-zinc-100">${nActiveRooms}</span> |
+      Connected to entrance: <span class="text-zinc-100">${nConnectedActiveRooms}</span> |
+      Loop: ${hasLoop ? "<span class='text-red-400 font-semibold'>DETECTED</span>" : "<span class='text-emerald-300'>none</span>"}
+    </div>
+    <div class="mt-1">${uiMessage ? uiMessage : ""}</div>
+    <div class="mt-1">Red outline = room not connected to Entrance (would not “exist” per the transcript rule).</div>
+  `;
+
+  controls.append(row1, row2, status);
+  gridCol.appendChild(controls);
+
+  /* ---------- FLOOR PALETTE ---------- */
+  const floorWrap = document.createElement("div");
+  floorWrap.className = "mt-4 text-center";
+
+  const floorGrid = document.createElement("div");
+  floorGrid.className = "grid grid-cols-5 gap-2 justify-center";
+
+  FLOOR_TILES.forEach(f => {
+    const b = document.createElement("button");
+    b.className = "cell";
+    if (selectedFloor === f) b.classList.add("ring-2","ring-emerald-500");
+
+    const d = document.createElement("div");
+    d.className = "floor " + [...f].map(x => "open-" + x).join(" ");
+    b.appendChild(d);
+
+    b.onclick = () => {
+      selectedFloor = selectedFloor === f ? null : f;
+      selectedRoom = null;
+      render();
+    };
+
+    floorGrid.appendChild(b);
+  });
+
+  floorWrap.append(floorGrid);
+  gridCol.appendChild(floorWrap);
+
+  /* ---------- ROOM PALETTE ---------- */
+  const roomCol = document.createElement("div");
+  roomCol.innerHTML = "<h2 class='font-semibold mb-2'>Rooms</h2>";
+
+  Object.keys(ROOM_NAMES).forEach(r => {
+    const b = document.createElement("button");
+    b.className = "flex gap-2 items-center px-3 py-2 rounded bg-zinc-700 w-full";
+    if (selectedRoom === r) b.classList.add("ring-2","ring-emerald-500");
+
+    const img = document.createElement("img");
+    img.src = ROOM_ICONS[r];
+    img.className = "w-5 h-5";
+
+    b.append(img, ROOM_NAMES[r]);
+    b.onclick = () => {
+      selectedRoom = selectedRoom === r ? null : r;
+      selectedFloor = null;
+      render();
+    };
+    roomCol.appendChild(b);
+  });
+
+  /* ---------- ACTIVE BONUSES ---------- */
+  const bonusCol = document.createElement("div");
+  bonusCol.className = "w-72";
+  bonusCol.innerHTML = "<h2 class='font-semibold mb-2'>Active Bonuses (Connected Only)</h2>";
+
+  const counts = {};
+  const boosters = {};
+  const boostReport = [];
+
+  // IMPORTANT: only count rooms that are active AND connected to Entrance
+  grid.forEach((c, i) => {
+    if (!c.room || c.faded) return;
+    if (!connected.has(i)) return;
+
+    const effective = getEffectiveRoomKey(i) || c.room;
+
+    if (ROOM_TILES[effective]) counts[effective] = (counts[effective] || 0) + 1;
+    if (BOOST_RULES && BOOST_RULES[c.room]) boosters[c.room] = (boosters[c.room] || 0) + 1;
+  });
+
+  const grouped = {};
+
+  Object.entries(counts).forEach(([room, base]) => {
+    let mult = 1;
+    Object.entries(boosters).forEach(([b, n]) => {
+      const rule = BOOST_RULES[b];
+      if (rule.targets.includes(room)) mult += rule.amount * n;
+    });
+
+    if (mult > 1) {
+      boostReport.push(`${ROOM_NAMES[room]}: +${Math.round((mult - 1) * 100)}% (included)`);
+    }
+
+    formatBonuses(room, base * mult).forEach(text => {
+      const cat = categoryOf(text);
+      grouped[cat] ??= [];
+      grouped[cat].push(text);
+    });
+  });
+
+  Object.entries(grouped).forEach(([cat, bonuses]) => {
+    const h = document.createElement("h3");
+    h.className = "mt-3 font-semibold text-emerald-400";
+    h.textContent = cat;
+    bonusCol.appendChild(h);
+    bonuses.forEach(text => {
+      const d = document.createElement("div");
+      d.className = "text-sm";
+      d.textContent = text;
+      bonusCol.appendChild(d);
+    });
+  });
+
+  if (boostReport.length) {
+    const h = document.createElement("h3");
+    h.className = "mt-3 font-semibold text-sky-400";
+    h.textContent = "Boosted Effects (Already Included)";
+    bonusCol.appendChild(h);
+    boostReport.forEach(t => {
+      const d = document.createElement("div");
+      d.className = "text-sm opacity-80";
+      d.textContent = t;
+      bonusCol.appendChild(d);
+    });
+  }
+
+  if (Object.keys(grouped).length === 0) {
+    const d = document.createElement("div");
+    d.className = "text-sm opacity-60";
+    d.textContent = "No active bonuses (or nothing connected).";
+    bonusCol.appendChild(d);
+  }
+
+  /* ---------- APPEND ALL ---------- */
+  container.append(gridCol, roomCol, bonusCol);
+  app.appendChild(container);
+}
+
+render();
+</script>
+</body>
+</html>
