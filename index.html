@@ -529,21 +529,90 @@ function getSnakePath() {
   cachedSnake = path.filter(i => i !== entranceIndex());
   return cachedSnake;
 }
-function expectedSnakeRoom(step) { return SNAKE_PATTERN[step % SNAKE_PATTERN.length]; }
+
+/* ===============================
+   Pattern Phase Detection (Syncs solver to board)
+  
+   =============================== */
+
+// Helper: Match room types, treating Upgraded Barracks as valid matches for the base pattern
+function roomsMatch(boardRoom, patternRoom) {
+  if (!boardRoom) return false;
+  if (boardRoom === patternRoom) return true;
+  // Video Strategy: "Barracks" in the pattern can be Transcendent or Legion (upgraded)
+  if ((boardRoom === "LegionBarrack" || boardRoom === "TranscendentBarracks") &&
+      (patternRoom === "LegionBarrack" || patternRoom === "TranscendentBarracks")) {
+    return true;
+  }
+  return false;
+}
+
+// Scans the board to find which "Phase" (rotation) of the snake pattern matches your existing rooms best.
+function detectSnakePhase() {
+  const path = getSnakePath();
+  let bestOffset = 0;
+  let maxScore = -Infinity;
+
+  // Try all 4 possible rotations of the pattern to see which one fits your board
+  for (let offset = 0; offset < SNAKE_PATTERN.length; offset++) {
+    let matches = 0;
+    let mismatches = 0;
+    let hasRoom = false;
+
+    for (let step = 0; step < path.length; step++) {
+      const i = path[step];
+      const cellRoom = grid[i].room;
+      if (!cellRoom) continue; // Ignore empty slots
+
+      hasRoom = true;
+      const expected = SNAKE_PATTERN[(step + offset) % SNAKE_PATTERN.length];
+      
+      if (roomsMatch(cellRoom, expected)) {
+        matches++;
+      } else {
+        mismatches++;
+      }
+    }
+
+    // Score favors matches and heavily penalizes mismatches
+    const score = hasRoom ? (matches - (mismatches * 2)) : 0;
+
+    if (score > maxScore) {
+      maxScore = score;
+      bestOffset = offset;
+    }
+  }
+
+  // Default to 0 (Armoury start) if board is empty or ambiguous
+  if (maxScore <= 0 && bestOffset === 0) return 0;
+  return bestOffset;
+}
+
+function expectedSnakeRoom(step, offset = 0) { 
+  return SNAKE_PATTERN[(step + offset) % SNAKE_PATTERN.length]; 
+}
+
 function snakeFirstEmptyStep() {
   const path = getSnakePath();
   for (let step = 0; step < path.length; step++) if (!grid[path[step]].room) return step;
   return null;
 }
+
 function validateSnakePrefix() {
   const path = getSnakePath();
+  const offset = detectSnakePhase(); // Auto-detect phase
   const mismatches = [];
+  
   for (let step = 0; step < path.length; step++) {
     const i = path[step];
     const room = grid[i].room;
     if (!room) break;
-    const exp = expectedSnakeRoom(step);
-    if (room !== exp) mismatches.push({ step, index: i, expected: exp, found: room });
+    
+    const exp = expectedSnakeRoom(step, offset);
+    // Use the robust matcher (handles Legion/Transcendent equivalence)
+    if (!roomsMatch(room, exp)) {
+      mismatches.push({ step, index: i, expected: exp, found: room });
+    }
   }
   return mismatches;
 }
@@ -658,17 +727,34 @@ function applyFloorPlan(newFloorMap, requiredCards) {
 function suggestNext(kind) {
   if (kind === "snake") {
     const path = getSnakePath();
+    const offset = detectSnakePhase(); // <--- KEY FIX: Sync with board state
     const mismatches = validateSnakePrefix();
+    
+    // Find the first empty step (gap) to fill or extend
     const step = snakeFirstEmptyStep();
     if (step === null) return { ok: false, reason: "Snake path is full." };
+    
     const i = path[step];
-    const roomKey = expectedSnakeRoom(step);
+    
+    // Predict the next room based on the detected phase
+    const roomKey = expectedSnakeRoom(step, offset);
 
     if (useHandMode) {
       const counts = handCounts();
-      if ((counts[roomKey] || 0) > 0) return { ok: true, move: { kind, index: i, step, roomKey, fromHand: true }, warn: mismatches.length ? mismatches : null };
-      if (medallions.Uramot > 0) return { ok: true, move: { kind, index: i, step, roomKey, useUramot: true }, warn: mismatches.length ? mismatches : null };
-      return { ok: false, reason: `Need ${ROOM_NAMES[roomKey]} but it isn't in your hand. Use Puaets to reroll, or Uramot wildcard to place anyway.` };
+      // Check if we have the needed room (or if we need Barracks, do we have Legion?)
+      const hasCard = (counts[roomKey] || 0) > 0;
+      
+      // Strict hand check:
+      if (hasCard) {
+        return { ok: true, move: { kind, index: i, step, roomKey, fromHand: true }, warn: mismatches.length ? mismatches : null };
+      }
+      if (medallions.Uramot > 0) {
+        return { ok: true, move: { kind, index: i, step, roomKey, useUramot: true }, warn: mismatches.length ? mismatches : null };
+      }
+      return { 
+        ok: false, 
+        reason: `Autosnake (Phase ${offset}): Needs ${ROOM_NAMES[roomKey]} but it isn't in your hand. Use Puaets to reroll, or Uramot wildcard.` 
+      };
     }
 
     return { ok: true, move: { kind, index: i, step, roomKey }, warn: mismatches.length ? mismatches : null };
@@ -1527,6 +1613,7 @@ function render() {
     <div class="mini">
       <div class="font-semibold text-zinc-100 mb-1">Fixes in this build</div>
       <ul class="list-disc ml-5">
+        <li><b>New: Auto-Snake Phase Detection</b>: The solver now scans your board to see if you are already mid-cycle (e.g. just placed Spymaster) and suggests the correct next room immediately.</li>
         <li><b>Quipal crash fixed</b>: no more undefined candidates; capped Quipal suggestions to 10.</li>
         <li><b>+ / – no longer disappear</b>: controls are inside the cell + use opacity instead of display + fixed transform override.</li>
         <li><b>Hand supports floors</b>: you can now put path tiles in your hand and consume them on placement (and optionally for solver auto-pathing).</li>
